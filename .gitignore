@@ -115,6 +115,8 @@ cython_debug/
 **/artifacts/
 /scratchpad/
 /run_*.sh
+/datasets
+/tools/ffmpeg/bin/ffmpeg
 
 # macOS
 .DS_Store

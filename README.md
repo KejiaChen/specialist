@@ -14,6 +14,9 @@ finger joint angles.
 A transform is a_T_b: p_a = a_T_b · p_b, the pose of frame b in frame a. a_R_b
 is its rotation, and a_t_b is b's origin in frame a.
 
+For the lab workflow, including data collection, environment setup, trial
+processing, and playback, see the [Specialist 使用指南](docs/workflow.md).
+
 ## Install
 
 ```
