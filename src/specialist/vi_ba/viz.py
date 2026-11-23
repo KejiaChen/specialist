@@ -115,7 +115,7 @@ def _vec3_column(values: Float64Array) -> pa.FixedSizeListArray:
   return pa.FixedSizeListArray.from_arrays(flat, 3)
 
 
-def _trail_segments(traj: Float64Array, times: Float64Array, duration: float) -> Any:
+def _trial_segments(traj: Float64Array, times: Float64Array, duration: float) -> Any:
   """Segments from each sample's predecessor, zero-length past a ``duration`` gap."""
   previous = np.concatenate([traj[:1], traj[:-1]])
   outran = np.concatenate(([0.0], np.diff(times))) > duration
@@ -556,7 +556,7 @@ def _trajectory_streams(
   world_T_base_tag: tuple[Float64Array, Float64Array],
   color: tuple[int, int, int],
 ) -> None:
-  """The fading trail of the gripper TCP along the propagated series."""
+  """The fading trial of the gripper TCP along the propagated series."""
   world_t_base_tag, world_R_base_tag = world_T_base_tag
   world_t_tcp = world_t_base_tag + world_R_base_tag @ np.asarray(
     data.tcp_in_base_tag, dtype=np.float64
@@ -568,7 +568,7 @@ def _trajectory_streams(
     entity_path,
     [rr.TimeColumn(schema.TIMELINE, duration=data.highrate_times)],
     rr.LineStrips3D.columns(
-      strips=_trail_segments(
+      strips=_trial_segments(
         world_t_tcp, data.highrate_times, TRAJECTORY_TRAIL_DURATION
       )
     ),

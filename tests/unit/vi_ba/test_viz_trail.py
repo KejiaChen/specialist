@@ -16,7 +16,7 @@ from specialist.vi_ba.viz import (
   Layers,
   _camera_indexes,
   _gripper_streams,
-  _trail_segments,
+  _trial_segments,
   _trajectory_streams,
 )
 from tests.record_fixtures import camera_estimate
@@ -25,11 +25,11 @@ from tests.record_fixtures import camera_estimate
 def test_each_sample_carries_the_step_that_reached_it() -> None:
   """The first step and a step longer than the window stand still."""
   traj = np.arange(12, dtype=np.float64).reshape(4, 3)
-  segments = _trail_segments(traj, np.array([0.0, 0.1, 5.0, 5.1]), 1.0)
+  segments = _trial_segments(traj, np.array([0.0, 0.1, 5.0, 5.1]), 1.0)
   assert np.array_equal(segments, np.stack([traj[[0, 0, 2, 2]], traj], axis=1))
 
 
-def test_the_trail_ends_at_the_tcp_on_the_base_tag() -> None:
+def test_the_trial_ends_at_the_tcp_on_the_base_tag() -> None:
   """Each step ends where the body pose carries the base tag's TCP offset."""
   data = camera_estimate("cam00")
   chunks: list[Chunk] = []

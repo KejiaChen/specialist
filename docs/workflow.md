@@ -88,7 +88,7 @@ datasets/
 
 用 `./scripts/process-trial.sh --help` 查看参数。每个阶段做什么、生成哪些文件和怎么排查失败，见[处理流程说明](process_and_reconstruct.md)。
 
-### 示例：处理 `pick_cup_01` 的双机试次
+### 示例：处理 dual arm `pick_cup_01` 
 
 ```bash
 ./scripts/process-trial.sh pick_cup_01 dual trail_261116_001 --anchor-ids 0,1 --anchor-size 0.100

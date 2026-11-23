@@ -20,7 +20,7 @@ __all__ = [
   "state_card_blueprint",
 ]
 
-# Seconds the trajectory ribbon trails the cursor; segments and time window share it.
+# Seconds the trajectory ribbon trials the cursor; segments and time window share it.
 TRAJECTORY_TRAIL_DURATION = 1.0
 
 # Keyframe-grid rate (Hz) of the time panel, the same at any capture rate.
@@ -111,7 +111,7 @@ def _scene(
 ) -> rrb.Spatial3DView:
   """The shared 3D view of triads, anchors and ribbons; ``overrides`` add to these."""
   every: dict[rr.encodings.EntityPath | str, Any] = {
-    **{f"/{schema.trajectory(s)}": _trail_window() for s in slots},
+    **{f"/{schema.trajectory(s)}": _trial_window() for s in slots},
     **_triad_overrides(slots, anchor_tag_ids, anchor_tag_size),
     **{
       f"/{schema.landmark(s, lens)}": rrb.EntityBehavior(visible=False)
@@ -120,7 +120,7 @@ def _scene(
     },
     **(overrides or {}),
   }
-  # Rerun matches a wildcard only as a trailing /**, so every path is literal.
+  # Rerun matches a wildcard only as a trialing /**, so every path is literal.
   return rrb.Spatial3DView(
     name="3D",
     origin="/",
@@ -201,7 +201,7 @@ def state_card_blueprint(frame_width: int) -> rrb.TableBlueprint:
   )
 
 
-def _trail_window() -> rrb.VisibleTimeRanges:
+def _trial_window() -> rrb.VisibleTimeRanges:
   """The time window a trajectory ribbon draws; a view without it draws one step."""
   return rrb.VisibleTimeRanges(
     [

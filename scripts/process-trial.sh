@@ -63,24 +63,21 @@ for id in "${anchors[@]}"; do
 done
 
 root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
-[[ -L "$root/datasets" ]] || die "$root/datasets 必须是指向外置盘数据根目录的软链接。"
+# Resolve datasets once; accept either a directory or a symlink on any filesystem.
 data_root="$(realpath -e -- "$root/datasets" 2>/dev/null)" ||
-  die "datasets 的目标无法访问，请检查外置盘是否已挂载。"
-disk="${data_root%/*}"
-[[ ${data_root##*/} == specialist_data && -d $data_root ]] ||
-  die "datasets 必须指向外置盘的 specialist_data/。当前目标为 $data_root。"
-mountpoint -q -- "$disk" || die "外置盘未挂载在 $disk。"
-[[ $(stat -c %d -- "$data_root") != "$(stat -c %d -- "$root")" ]] ||
-  die "datasets 与项目位于同一文件系统，请检查外置盘软链接。"
-[[ -w $data_root ]] || die "外置盘数据目录不可写。请在可写的宿主机终端运行。"
+  die "datasets 的目标无法访问，请检查数据目录或软链接。"
+[[ -d $data_root && -r $data_root && -x $data_root ]] ||
+  die "数据根目录不存在、不可读或无法进入：$data_root"
+[[ -w $data_root ]] || die "数据根目录不可写：$data_root"
 
-# Require both a canonical path and the same mount as specialist_data.
+# Keep every input and output directory inside the resolved data root.
 require_data_dir() {
   local directory=$1
   [[ -d "$directory" && $(realpath -e -- "$directory") == "$directory" ]] ||
     die "目录缺失或通过软链接跳转：$directory"
-  [[ $(findmnt -n -o TARGET --target "$directory") == "$disk" ]] ||
-    die "目录不在同一个外置盘挂载点：$directory"
+  [[ $directory == "$data_root" || $directory == "$data_root/"* ]] ||
+    die "目录不在 datasets 数据根目录内：$directory"
+  [[ -r $directory && -x $directory ]] || die "目录不可读或无法进入：$directory"
 }
 
 setup_dir="$data_root/$setup"
