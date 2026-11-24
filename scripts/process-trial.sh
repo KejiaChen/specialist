@@ -5,11 +5,14 @@ shopt -s nullglob
 usage() {
   cat <<'EOF'
 用法
-  ./scripts/process-trial.sh <setup> <single|dual> <trail_YYMMDD_NNN> --anchor-ids <ID,ID,...> --anchor-size <米> [--state] [--replay]
+  ./scripts/process-trial.sh <setup> <single|dual> <trial_YYMMDD_NNN> --anchor-ids <ID,ID,...> --anchor-size <米> [--state] [--replay]
 
 第一个 Anchor ID 定义世界参考坐标系。所有产物写入对应 setup 的 processed/<模式>/<trial>/。
 --state   同时生成训练 state
 --replay  处理结束后打开 Rerun
+
+--state 发现 Hold 超出前 10% 时，会显示百分比和绝对秒数并请求确认；
+确认后另存为 <trial>_hold_trim/，同步裁剪重建各层并生成 state，保留完整重建。
 
 开发环境和日常用法见 docs/workflow.md。执行步骤和日志说明见 docs/process_and_reconstruct.md。
 EOF
@@ -49,8 +52,8 @@ done
 
 [[ $setup =~ ^[[:alnum:]][[:alnum:]_-]*$ ]] || die "setup 必须是一个目录名。"
 [[ $mode == single || $mode == dual ]] || die "模式必须是 single 或 dual。"
-[[ $trial =~ ^trail_[0-9]{6}_[0-9]{3}$ ]] ||
-  die "试次目录名应为 trail_YYMMDD_NNN，例如 trail_261116_001。"
+[[ $trial =~ ^trial_[0-9]{6}_[0-9]{3}$ ]] ||
+  die "试次目录名应为 trial_YYMMDD_NNN，例如 trial_261116_001。"
 [[ $anchor_ids =~ ^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*))*$ ]] ||
   die "请用 --anchor-ids 提供逗号分隔的非负整数 ID。"
 [[ $anchor_size =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ && $anchor_size =~ [1-9] ]] ||
@@ -200,16 +203,6 @@ for file in "estimate/$session.rrd" "viz/$session.rrd" "blueprints/specialist.rb
   [[ -s "$dataset/$file" ]] || die "缺少重建产物 $file。"
 done
 
-state_failed=false
-if $write_state; then
-  if ! run_step '训练 state' state.log env TMPDIR="$scratch" uv run --no-sync \
-    python scripts/state.py --base "$base" --estimate "$dataset/estimate/$session.rrd" \
-    --output-dir "$dataset" || [[ ! -s "$dataset/state_s8_r100/$session.rrd" ]]; then
-    state_failed=true
-    rm -rf -- "$dataset/state_s8_r100"
-  fi
-fi
-
 cp -a -- "$reports" "$dataset/reports"
 require_data_dir "$output_parent"
 mv -Tn -- "$dataset" "$output"
@@ -217,16 +210,47 @@ mv -Tn -- "$dataset" "$output"
 published=true
 cleanup
 trap - EXIT
+
+# State may need user confirmation and create a separate, fully trimmed dataset.
+# Publish the verified reconstruction first so either choice leaves it available.
+dataset="$output"
+reports="$output/reports"
+scratch="$(mktemp -d -- "$output_parent/.$trial.state.XXXXXXXX")"
+trap 'rm -rf -- "$scratch"' EXIT
+state_failed=false
+if $write_state; then
+  trim_suffix="$(uv run --no-sync python -c \
+    'from specialist_dataset.trim import TRIM_CONFIG; print(TRIM_CONFIG.output_suffix)')"
+  trimmed_output="${output}${trim_suffix}"
+  if ! run_step '训练 state' state.log env TMPDIR="$scratch" uv run --no-sync \
+    python scripts/state_with_trim.py --base "$output/base/$session.rrd" \
+    --estimate "$output/estimate/$session.rrd" --output-dir "$output"; then
+    state_failed=true
+  elif [[ -s "$output/state_s8_r100/$session.rrd" ]]; then
+    dataset="$output"
+  elif [[ -s "$trimmed_output/state_s8_r100/$session.rrd" ]]; then
+    dataset="$trimmed_output"
+    cp -- "$reports/state.log" "$dataset/reports/state.log"
+  else
+    state_failed=true
+  fi
+fi
+rm -rf -- "$scratch"
+trap - EXIT
 exec {trial_lock}<&-
 
-asset="$output/assets/${assets[0]##*/}"
-printf '重建结果 %s\n回放命令\n' "$output"
+asset="$dataset/assets/${assets[0]##*/}"
+printf '重建结果 %s\n' "$output"
+if [[ $dataset != "$output" ]]; then
+  printf '裁剪及训练 state %s\n' "$dataset"
+fi
+printf '回放命令\n'
 printf 'SPECIALIST_DATASET=%q SPECIALIST_SESSION=%q SPECIALIST_ASSET=%q %q\n' \
-  "$output" "$session" "$asset" "$root/scripts/view-reconstruction.sh"
+  "$dataset" "$session" "$asset" "$root/scripts/view-reconstruction.sh"
 if $state_failed; then
   die "重建已保存。训练 state 失败，日志见 $output/reports/state.log。"
 fi
 if $replay; then
-  SPECIALIST_DATASET="$output" SPECIALIST_SESSION="$session" SPECIALIST_ASSET="$asset" \
+  SPECIALIST_DATASET="$dataset" SPECIALIST_SESSION="$session" SPECIALIST_ASSET="$asset" \
     exec "$root/scripts/view-reconstruction.sh"
 fi

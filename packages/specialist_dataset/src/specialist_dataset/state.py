@@ -10,9 +10,11 @@ Float64Array = npt.NDArray[np.float64]
 Int64Array = npt.NDArray[np.int64]
 
 __all__ = [
+  "HOLD_HEAD",
   "finger",
   "hands",
   "hold",
+  "hold_interval",
   "image_frames",
   "lattice_brackets",
   "lerp",
@@ -27,19 +29,18 @@ _MIN_ANGLE = 3.0
 _MIN_AGREEMENT = 0.75
 _HOLD_SPEED = 0.15
 _HOLD_MIN_DURATION = 0.4
-_HOLD_HEAD = 0.1
+HOLD_HEAD = 0.1
 _TAP_Z = 12.0
 _TAP_BURST_GAP = 0.5
 _TAP_TAIL = 0.9
 
 
-def hold(
+def hold_interval(
   times: Float64Array,
   anchor_distance: Float64Array,
   speed: Float64Array,
-  span: tuple[float, float],
-) -> float:
-  """When the start hold ends; refuses one too short or ending past the first tenth."""
+) -> tuple[float, float]:
+  """The full closest slow anchor approach; refuses a hold that is too short."""
   slow = speed <= _HOLD_SPEED
   if not slow.any():
     raise ValueError("the gripper never slows near an anchor")
@@ -54,10 +55,21 @@ def hold(
       f"the closest slow anchor approach lasts {times[hi] - times[lo]:.2f} s, "
       f"under the {_HOLD_MIN_DURATION} s hold"
     )
-  at = (times[hi] - span[0]) / (span[1] - span[0])
-  if at > _HOLD_HEAD:
+  return float(times[lo]), float(times[hi])
+
+
+def hold(
+  times: Float64Array,
+  anchor_distance: Float64Array,
+  speed: Float64Array,
+  span: tuple[float, float],
+) -> float:
+  """When the start hold ends; refuses one too short or ending past the first tenth."""
+  _, end = hold_interval(times, anchor_distance, speed)
+  at = (end - span[0]) / (span[1] - span[0])
+  if at > HOLD_HEAD:
     raise ValueError(f"the hold ends at {at:.0%} of the capture, past its first tenth")
-  return float(times[hi])
+  return end
 
 
 def _spike_times(

@@ -3,7 +3,7 @@
   "source_metadata_key": "Default.Metadata.offset_v3",
   "camera": "Insta360 X3",
   "firmware": "v1.0.83_build1",
-  "notes": "Factory per-lens calibration (40 floats). Layout: [lens_count, front_block(19), rear_block(19), trailer]. Block fields: xi, fx, fy, cx, cy, yaw_deg, pitch_deg, roll_deg, tx, ty, tz, k1, k2, k3, p1, p2, frame_width, frame_height, _unknown.",
+  "notes": "Factory per-lens calibration (40 floats). Layout: [lens_count, front_block(19), rear_block(19), trialer]. Block fields: xi, fx, fy, cx, cy, yaw_deg, pitch_deg, roll_deg, tx, ty, tz, k1, k2, k3, p1, p2, frame_width, frame_height, _unknown.",
   "offset_v3": [
     2.0,
     1.94817, 4625.45, 4623.58, 2968.61, 2994.87,
