@@ -15,7 +15,7 @@ cd ~/specialist-reconstruction/specialist
 root="$PWD"
 setup='<setup>'
 mode='<single|dual>'
-trial='<trail_YYMMDD_NNN>'
+trial='<trial_YYMMDD_NNN>'
 input="$root/datasets/$setup/$mode/$trial"
 dataset="$root/datasets/$setup/processed/$mode/$trial"
 export PATH="$root/tools/ffmpeg/bin:$HOME/.local/bin:$PATH"
@@ -76,31 +76,50 @@ mkdir -p -- "$dataset/reports" &&
 
 只有一个锚点时，删掉数组里的第二项。重建失败时先看 `estimate.log`。
 
-## 5. 生成训练 state
+## 5. 发布重建结果
 
-完整脚本在传入 `--state` 时执行本步。单独运行时使用同一会话的 `base` 和 `estimate`。成功后生成 `state_s8_r100/<session_id>.rrd`。开头 Hold 或结尾 Tap 检查失败时看 `state.log`。 [state 命令](../scripts/process-trial.sh#L207)
+完整脚本先把验证通过的重建产物和日志发布到 `processed/<mode>/<trial>/`，再处理可选的训练 state。这样取消裁剪或 state 生成失败时，完整重建仍可回放。手动命令已直接写入 `dataset`，可跳过这一步。 [发布代码](../scripts/process-trial.sh#L206)
 
-如果 `process-trial.sh` 处理后再单独生成训练state，直接使用它的产物目录作为 `dataset`。`tee -a` 会把本次输出追加到 `reports/state.log`，首次运行时会创建该文件。
+## 6. 生成训练 state
+
+完整脚本在传入 `--state` 时执行本步；不加该参数只做重建，不检查 Hold/Tap。单独运行时使用同一会话的 `base` 和 `estimate`。成功后生成 `state_s8_r100/<session_id>.rrd`。检查失败时看 `reports/state.log`。 [state 命令](../scripts/process-trial.sh#L225)
+
+完整脚本调用新增的 `scripts/state_with_trim.py`，负责确认和裁剪，然后复用原作者的 `scripts/state.py` 生成 state。`scripts/state.py` 保持严格模式，直接运行时仍会因 Hold 超出 10% 而报错。
+
+Hold 的结束时间必须位于采集时段前 10%，比例按所有相机 IMU 的整体起止时间计算。如果任一只手超出限制，程序会显示每只手的百分比、原始 `video_time` 秒数（absolute time，非墙上时钟），以及建议保留的共同区间，提示 `是否裁剪并生成训练 state？[y/N]`。
+
+输入 `y`、`yes` 或 `是` 后，程序同步裁剪 `base`、`estimate`、`viz`，只移除开头，使两个 Hold 的结束时间均位于新区间前 10%；单机使用同样规则。原始 INSV 和完整重建均保留，副本写入 `${dataset}_hold_trim/`，各层沿用原时间戳，不重新从零计时。H.264 视频会额外保留裁剪点之前最近的解码关键帧及所需数据，因此视频可能比轨迹多一小段前导帧。裁剪方案记录在副本的 `reports/hold_trim.json`。
+
+副本在 Hold/Tap、数据对齐和 state 写入全部成功后才发布。按回车、输入否、取消或没有交互终端时，不裁剪；如果无法同时保留两个完整 Hold 并满足前 10%，程序会报错。已有同名裁剪目录时也会停止，避免覆盖。
+
+如果 `process-trial.sh` 处理后再单独生成训练 state，直接使用它的产物目录作为 `dataset`。`tee -a` 会把本次输出追加到 `reports/state.log`，首次运行时会创建该文件。在交互终端执行，方便确认裁剪。
 
 ```bash
 cd ~/specialist-reconstruction/specialist
-# dataset="$PWD/datasets/pick_cup_01/processed/dual/trail_261116_001"
+# dataset="$PWD/datasets/pick_cup_01/processed/dual/trial_261116_001"
 # session='20261116_172034_IAQEB260436VUM'
 set -o pipefail
 
-  TMPDIR="$dataset" uv run --no-sync python scripts/state.py \
-    --base "$dataset/base/$session.rrd" --estimate "$dataset/estimate/$session.rrd" \
-    --output-dir "$dataset" \
-    2>&1 | tee -a "$dataset/reports/state.log"
+TMPDIR="$dataset" uv run --no-sync python scripts/state_with_trim.py \
+  --base "$dataset/base/$session.rrd" --estimate "$dataset/estimate/$session.rrd" \
+  --output-dir "$dataset" \
+  2>&1 | tee -a "$dataset/reports/state.log"
 ```
 
-## 6. 发布结果
+例如，已有的 `pass_pen_01` 这条结果可以直接运行，无需重新转换或重建：
 
-完整脚本把暂存区里的产物和日志发布到 `processed/<mode>/<trial>/`，然后清理临时文件。训练 state 失败时，脚本仍会保存已完成的重建和日志。手动命令已直接写入 `dataset`，单独执行时可跳过这一步。 [发布代码](../scripts/process-trial.sh#L216)
+```bash
+dataset="$PWD/datasets/pass_pen_01/processed/dual/trial_261120_002"
+session='20261120_173242_IAQEB260436VUM'
+uv run --no-sync python scripts/state_with_trim.py \
+  --base "$dataset/base/$session.rrd" \
+  --estimate "$dataset/estimate/$session.rrd" \
+  --output-dir "$dataset"
+```
 
 ## 7. 回放
 
-完整脚本会打印回放命令，传入 `--replay` 时会直接调用查看脚本。已有结果时，从仓库根目录运行 `./scripts/view-reconstruction.sh` 可打开本机默认的双机结果。其他结果使用下面的命令。 [回放入口](../scripts/process-trial.sh#L225) · [Rerun 加载参数](../scripts/view-reconstruction.sh#L11)
+完整脚本会打印回放命令，传入 `--replay` 时会直接调用查看脚本；确认裁剪且 state 成功后，回放命令指向 `_hold_trim` 副本。单独生成 state 时，按终端打印的裁剪目录设置 `dataset` 后回放。已有结果时，从仓库根目录运行 `./scripts/view-reconstruction.sh` 可打开本机默认的双机结果。其他结果使用下面的命令。 [回放入口](../scripts/process-trial.sh#L248) · [Rerun 加载参数](../scripts/view-reconstruction.sh#L11)
 
 ```bash
 cd ~/specialist-reconstruction/specialist
