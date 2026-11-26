@@ -189,11 +189,15 @@ def main(args: Args) -> None:
   blueprints_dir = args.output_dir / "blueprints"
   blueprints_dir.mkdir(parents=True, exist_ok=True)
   rbl = blueprints_dir / "specialist.rbl"
-  blueprint_for_slots(
-    [c.slot for c in estimate.cameras],
-    anchor_tag_ids=sorted(estimate.world_T_anchor),
-    anchor_tag_size=args.anchor.tag_size,
-  ).save(schema.APPLICATION_ID, str(rbl))
+  # Cropped datasets can share the existing blueprint inode.
+  with tempfile.TemporaryDirectory(dir=blueprints_dir) as stage:
+    pending = Path(stage) / rbl.name
+    blueprint_for_slots(
+      [c.slot for c in estimate.cameras],
+      anchor_tag_ids=sorted(estimate.world_T_anchor),
+      anchor_tag_size=args.anchor.tag_size,
+    ).save(schema.APPLICATION_ID, str(pending))
+    pending.replace(rbl)
   mark("layers written")
   print(f"Wrote {rrd_path}, {viz_path} and {rbl}")
 

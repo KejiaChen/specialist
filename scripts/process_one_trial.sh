@@ -5,14 +5,14 @@ shopt -s nullglob
 usage() {
   cat <<'EOF'
 用法
-  ./scripts/process-trial.sh <setup> <single|dual> <trial_YYMMDD_NNN> --anchor-ids <ID,ID,...> --anchor-size <米> [--state] [--replay]
+  ./scripts/process_one_trial.sh <setup> <single|dual> <trial_YYMMDD_NNN> --anchor-ids <ID,ID,...> --anchor-size <米> [--state] [--replay]
 
-第一个 Anchor ID 定义世界参考坐标系。所有产物写入对应 setup 的 processed/<模式>/<trial>/。
+第一个 Anchor ID 定义世界参考坐标系。所有产物写入对应 setup 的 <模式>/processed/<trial>/。
 --state   同时生成训练 state
 --replay  处理结束后打开 Rerun
 
---state 发现 Hold 超出前 10% 时，会显示百分比和绝对秒数并请求确认；
-确认后另存为 <trial>_hold_trim/，同步裁剪重建各层并生成 state，保留完整重建。
+--state 发现 Hold 超出前 10% 或最强 Tap 早于最后 20% 时，会显示百分比和绝对秒数并请求确认；
+确认后将裁剪清单和 state 存入试次目录，回放时按需生成裁剪层。
 
 开发环境和日常用法见 docs/workflow.md。执行步骤和日志说明见 docs/process_and_reconstruct.md。
 EOF
@@ -67,7 +67,7 @@ done
 
 root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 # Resolve datasets once; accept either a directory or a symlink on any filesystem.
-data_root="$(realpath -e -- "$root/datasets" 2>/dev/null)" ||
+data_root="$(realpath -e -- "${SPECIALIST_DATA_ROOT:-$root/datasets}" 2>/dev/null)" ||
   die "datasets 的目标无法访问，请检查数据目录或软链接。"
 [[ -d $data_root && -r $data_root && -x $data_root ]] ||
   die "数据根目录不存在、不可读或无法进入：$data_root"
@@ -84,7 +84,12 @@ require_data_dir() {
 }
 
 setup_dir="$data_root/$setup"
-input="$setup_dir/$mode/$trial"
+layout=$("$root/.venv/bin/python" "$root/scripts/dataset_layout.py" "$setup_dir" "$mode")
+mapfile -t paths <<< "$layout"
+input="${paths[0]}/$trial"
+default_processed=${paths[3]}
+mode_suffix=
+if [[ ${paths[4]} == legacy ]]; then mode_suffix="/$mode"; fi
 require_data_dir "$input"
 exec {trial_lock}<"$input"
 flock -n "$trial_lock" || die "此 trial 已有处理任务在运行：$input"
@@ -111,15 +116,32 @@ for camera_dir in "${camera_dirs[@]}"; do
   lenses+=("$master" "$rear")
 done
 
-output_parent="$setup_dir/processed/$mode"
+processed_dir=${SPECIALIST_PROCESSED_ROOT:-"$default_processed"}
+if [[ $processed_dir != "$default_processed" ]]; then
+  [[ ${processed_dir%/*} == "$default_processed" && ${processed_dir##*/} =~ ^anchors_[0-9.,_]+$ ]] ||
+    die "备用重建目录须位于本 setup 的 processed/anchors_* 下。"
+fi
+output_parent="$processed_dir$mode_suffix"
 output="$output_parent/$trial"
-for directory in "$setup_dir" "$setup_dir/processed" "$output_parent"; do
+for directory in "$setup_dir" "$default_processed" "$processed_dir" "$output_parent"; do
   if [[ -e $directory || -L $directory ]]; then
     require_data_dir "$directory"
   fi
 done
-[[ ! -e $output && ! -L $output ]] ||
-  die "此 trial 已有输出：$output。可从该目录回放已有结果。"
+# 配对可能已发布单机 base。只接续这个阶段，完整或其他已有输出仍受保护。
+reuse_base=false
+if [[ -e $output || -L $output ]]; then
+  require_data_dir "$output"
+  shopt -s dotglob
+  existing=("$output"/*)
+  shopt -u dotglob
+  if [[ $mode == single && ${#existing[@]} == 1 && ${existing[0]} == "$output/base" ]]; then
+    require_data_dir "$output/base"
+    reuse_base=true
+  else
+    die "此 trial 已有输出：$output。请检查已有结果。"
+  fi
+fi
 
 export PATH="$root/tools/ffmpeg/bin:$HOME/.local/bin:$PATH"
 for program in uv ffprobe ffmpeg; do
@@ -145,6 +167,7 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir -- "$dataset" "$reports" "$scratch"
+printf '%s %s\n' "$anchor_ids" "$anchor_size" > "$reports/reconstruction_anchors.txt"
 
 check_raw() {
   local lens codec width height stream master
@@ -184,8 +207,19 @@ run_step() {
 
 printf '输入 %s\n产物 %s\n' "$input" "$output"
 run_step '输入检查' raw_check.log check_raw
-run_step '转换与同步' convert.log env TMPDIR="$scratch" uv run --no-sync \
-  python scripts/convert.py --input-insvs "${masters[@]}" --output-dir "$dataset"
+base_source="$output"
+if [[ $mode == single && $processed_dir != "$default_processed" && ! -d "$output/base" ]]; then
+  base_source="$default_processed$mode_suffix/$trial"
+fi
+if $reuse_base || [[ $base_source != "$output" && -d "$base_source/base" ]]; then
+  base=$("$root/.venv/bin/python" "$root/scripts/checked_single_base.py" "$base_source" "${lenses[@]}")
+  mkdir -- "$dataset/base"
+  cp -al -- "$base_source/base/." "$dataset/base/" 2>/dev/null || cp -an -- "$base_source/base/." "$dataset/base/"
+  printf '复用已校验的 base：%s\n' "$base" | tee "$reports/convert.log"
+else
+  run_step '转换与同步' convert.log env TMPDIR="$scratch" uv run --no-sync \
+    python scripts/convert.py --input-insvs "${masters[@]}" --output-dir "$dataset"
+fi
 bases=("$dataset"/base/*.rrd)
 (( ${#bases[@]} == 1 )) && [[ -s ${bases[0]} ]] ||
   die "转换没有生成唯一可用的 base RRD。"
@@ -205,52 +239,65 @@ done
 
 cp -a -- "$reports" "$dataset/reports"
 require_data_dir "$output_parent"
-mv -Tn -- "$dataset" "$output"
-[[ ! -e $dataset ]] || die "发布产物时目标已存在：$output"
+if $reuse_base; then
+  # 在同一文件系统上原子交换两个目录，中断时原 base 或完整重建始终可读。
+  "$root/.venv/bin/python" - "$dataset" "$output" <<'PY'
+import ctypes
+import os
+import sys
+
+libc = ctypes.CDLL(None, use_errno=True)
+at_fdcwd, rename_exchange = -100, 2
+if libc.renameat2(at_fdcwd, os.fsencode(sys.argv[1]), at_fdcwd, os.fsencode(sys.argv[2]), rename_exchange):
+    error = ctypes.get_errno()
+    raise OSError(error, os.strerror(error), sys.argv[2])
+PY
+else
+  mv -Tn -- "$dataset" "$output"
+  [[ ! -e $dataset ]] || die "发布产物时目标已存在：$output"
+fi
 published=true
 cleanup
 trap - EXIT
 
-# State may need user confirmation and create a separate, fully trimmed dataset.
+# State may need user confirmation for a crop.
 # Publish the verified reconstruction first so either choice leaves it available.
 dataset="$output"
 reports="$output/reports"
 scratch="$(mktemp -d -- "$output_parent/.$trial.state.XXXXXXXX")"
 trap 'rm -rf -- "$scratch"' EXIT
 state_failed=false
+replay_args=()
 if $write_state; then
-  trim_suffix="$(uv run --no-sync python -c \
-    'from specialist_dataset.trim import TRIM_CONFIG; print(TRIM_CONFIG.output_suffix)')"
-  trimmed_output="${output}${trim_suffix}"
   if ! run_step '训练 state' state.log env TMPDIR="$scratch" uv run --no-sync \
     python scripts/state_with_trim.py --base "$output/base/$session.rrd" \
     --estimate "$output/estimate/$session.rrd" --output-dir "$output"; then
     state_failed=true
-  elif [[ -s "$output/state_s8_r100/$session.rrd" ]]; then
-    dataset="$output"
-  elif [[ -s "$trimmed_output/state_s8_r100/$session.rrd" ]]; then
-    dataset="$trimmed_output"
-    cp -- "$reports/state.log" "$dataset/reports/state.log"
-  else
+  elif [[ ! -s "$output/state_s8_r100/$session.rrd" ]]; then
     state_failed=true
+  elif [[ -f "$output/state_trim_reports/hold_trim.json" ]]; then
+    replay_args=(--trim)
   fi
 fi
 rm -rf -- "$scratch"
 trap - EXIT
 exec {trial_lock}<&-
 
-asset="$dataset/assets/${assets[0]##*/}"
+asset="$output/assets/${assets[0]##*/}"
 printf '重建结果 %s\n' "$output"
-if [[ $dataset != "$output" ]]; then
+if (( ${#replay_args[@]} )); then
   printf '裁剪及训练 state %s\n' "$dataset"
 fi
 printf '回放命令\n'
-printf 'SPECIALIST_DATASET=%q SPECIALIST_SESSION=%q SPECIALIST_ASSET=%q %q\n' \
+printf 'SPECIALIST_DATASET=%q SPECIALIST_SESSION=%q SPECIALIST_ASSET=%q %q' \
   "$dataset" "$session" "$asset" "$root/scripts/view-reconstruction.sh"
+if (( ${#replay_args[@]} )); then printf ' %q' "${replay_args[@]}"; fi
+printf '\n'
 if $state_failed; then
-  die "重建已保存。训练 state 失败，日志见 $output/reports/state.log。"
+  echo "重建已保存。训练 state 失败，日志见 $output/reports/state.log。" >&2
+  exit 3  # 批处理单独记录 state 失败。
 fi
 if $replay; then
   SPECIALIST_DATASET="$dataset" SPECIALIST_SESSION="$session" SPECIALIST_ASSET="$asset" \
-    exec "$root/scripts/view-reconstruction.sh"
+    exec "$root/scripts/view-reconstruction.sh" "${replay_args[@]}"
 fi

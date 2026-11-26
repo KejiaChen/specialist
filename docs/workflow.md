@@ -78,30 +78,43 @@ datasets/
 回到项目根目录运行，替换尖括号占位符。脚本通过 `uv run --no-sync` 使用项目的虚拟环境。
 
 ```bash
-./scripts/process-trial.sh '<setup>' '<single|dual>' '<trial_YYMMDD_NNN>' --anchor-ids '<ID,ID,...>' --anchor-size '<anchor_size_m>'
+./scripts/process_one_trial.sh '<setup>' '<single|dual>' '<trial_YYMMDD_NNN>' --anchor-ids '<ID,ID,...>' --anchor-size '<anchor_size_m>'
 ```
 
-- `<setup>` 填采集布置目录名，例如 `pick_cup_01`。
+- `<setup>` 填采集布置目录名，例如 `pass_pen_01`。
 - `--anchor-ids` 填场地固定 AprilTag 的 ID，按逗号分隔，第一项是世界参考锚点。`--anchor-size` 填标签内方形的实际边长，单位为米。
 - 末尾加 `--replay` 可在重建后打开 Rerun。之后也可复制脚本打印的回放命令重开结果。需要训练数据时，在首次处理时加 `--state`。
-- `--state` 检查到 Hold 结束位置超过前 10% 时，会显示百分比和原始 `video_time` 秒数，并询问是否同步裁剪整个重建结果。确认后生成同级的 `<trial>_hold_trim/` 副本及训练 state；原始结果保留。请在交互终端执行，回车默认取消。已有结果可按[处理流程第 6 步](process_and_reconstruct.md#6-生成训练-state)单独生成 state。
-- 结果自动写到外置盘上的 `datasets/<setup>/processed/<mode>/<trial>/`。终端会输出结果位置或失败阶段和日志位置。
+- `--state` 检查到 Hold 结束位置超过前 10% 或最强 Tap 早于最后 20% 时，会先寻找可行的裁剪窗口。找到后显示百分比和原始 `video_time` 秒数，并询问是否同步裁剪各层的开头和尾段。确认后将裁剪清单和训练 state 写入当前试次。回放当前试次时默认打开全段，加 `--trim` 可查看裁剪段。请在交互终端执行，回车默认取消。已有结果可按[处理流程第 6 步](process_and_reconstruct.md#6-生成训练-state)单独生成 state。
+- 结果自动写到外置盘上的 `datasets/<setup>/<mode>/processed/<trial>/`。终端会输出结果位置或失败阶段和日志位置。
 
-用 `./scripts/process-trial.sh --help` 查看参数。每个阶段做什么、生成哪些文件和怎么排查失败，见[处理流程说明](process_and_reconstruct.md)。
+用 `./scripts/process_one_trial.sh --help` 查看参数。每个阶段做什么、生成哪些文件和怎么排查失败，见[处理流程说明](process_and_reconstruct.md)。
 
-### 示例：处理 dual arm `pick_cup_01` 
+### 示例：处理双机试次 `pass_pen_01`
 
 ```bash
-./scripts/process-trial.sh pick_cup_01 dual trial_261116_001 --anchor-ids 0,1 --anchor-size 0.100
+./scripts/process_one_trial.sh pass_pen_01 dual trial_261120_002 --anchor-ids 0,1 --anchor-size 0.100
 ```
 
-原始录像位于 `datasets/pick_cup_01/dual/trial_261116_001/`，处理结果会写到 `datasets/pick_cup_01/processed/dual/trial_261116_001/`。
+此例使用尚未迁移的旧数据集。原始录像位于 `datasets/pass_pen_01/dual/trial_261120_002/`，处理结果会写到 `datasets/pass_pen_01/processed/dual/trial_261120_002/`。
 
 ## 单机 X3 与 Vicon 批处理
 
+将每条试次的两份 X3 原片放在 `single/raw/x3/trial_YYMMDD_NNN/`，将同日期、同试次号的 CSV 放在 `single/raw/vicon/`。从项目根目录用 Bash 依次运行以下命令，替换尖括号占位符。
+
 ```bash
+# 1. 对齐 X3 和 Vicon 的时间
 bash scripts/pair_x3_vicon.sh --dataset 'datasets/<任务名>' --trials '<NNN>' \
+  --anchor-ids '<ID,ID,...>' --anchor-size '<anchor_size_m>'
+
+# 2. 逐条重建 X3 轨迹并生成训练 state
+bash scripts/reconstruct_and_calibrate.sh --dataset 'datasets/<任务名>' --trials '<NNN>' \
   --anchor-ids '<ID,ID,...>' --anchor-size '<anchor_size_m>'
 ```
 
+- `--dataset` 填含有 `single/` 的任务根目录。`--trials` 填三位试次号，可用空格列出多个，如 `048 052 073`，也可用 Bash 范围 `{048..100}`。重建时省略该参数会处理配对总表中的全部试次。
+- `--anchor-ids` 填逗号分隔的锚点 ID，首个为参考锚点。`--anchor-size` 填标签内方形边长，单位为米。重建时两项必填。配对时两项可选，仅在角速度匹配未通过、改用线速度时筛选已有轨迹。`--min-overlap-fraction` 控制配对所需的最低重叠比例，默认 `0.5`。
+- 重建会自动确认可行的 state 裁剪。需要评估位置误差时，在第二条命令末尾加 `--calibration NNN`，用所选的一条试次拟合相机到 Vicon 刚体的杆臂。标定成功后，用同一杆臂验证其余配对通过且有可用轨迹和 state 的试次。
+
 配对状态见 `single/pairing/summary.csv`，匹配判据和重跑方法见[时间配对说明](temporal_pairing_with_vicon.md)。
+
+最近完成批次的重建清单见 `single/reconstruction/reconstruction.csv`，最近一次评分见同目录的 `summary.csv`。轨迹复用规则和误差指标见[批量重建与标定说明](reconstruct_and_compare_with_vicon.md)。

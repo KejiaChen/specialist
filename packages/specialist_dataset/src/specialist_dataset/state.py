@@ -1,7 +1,9 @@
 """Numpy state-stream helpers: kept frames, row lattice, opening, hands and gestures."""
 
 import math
+from dataclasses import dataclass
 from functools import reduce
+from typing import NamedTuple
 
 import numpy as np
 import numpy.typing as npt
@@ -11,6 +13,9 @@ Int64Array = npt.NDArray[np.int64]
 
 __all__ = [
   "HOLD_HEAD",
+  "HOLD_MIN_DURATION",
+  "TAP_TAIL",
+  "TapBurst",
   "finger",
   "hands",
   "hold",
@@ -21,6 +26,7 @@ __all__ = [
   "nearest",
   "opening",
   "tap",
+  "tap_burst",
 ]
 
 _MAX_BRACKET = 0.0025
@@ -28,11 +34,11 @@ _PAIR_TOLERANCE = 0.05
 _MIN_ANGLE = 3.0
 _MIN_AGREEMENT = 0.75
 _HOLD_SPEED = 0.15
-_HOLD_MIN_DURATION = 0.4
+HOLD_MIN_DURATION = 0.4
 HOLD_HEAD = 0.1
 _TAP_Z = 12.0
 _TAP_BURST_GAP = 0.5
-_TAP_TAIL = 0.9
+TAP_TAIL = 0.8  # Earliest allowed first peak, as a fraction of the capture span.
 
 
 def hold_interval(
@@ -50,10 +56,10 @@ def hold_interval(
     lo -= 1
   while hi < len(slow) - 1 and slow[hi + 1]:
     hi += 1
-  if times[hi] - times[lo] < _HOLD_MIN_DURATION:
+  if times[hi] - times[lo] < HOLD_MIN_DURATION:
     raise ValueError(
       f"the closest slow anchor approach lasts {times[hi] - times[lo]:.2f} s, "
-      f"under the {_HOLD_MIN_DURATION} s hold"
+      f"under the {HOLD_MIN_DURATION} s hold"
     )
   return float(times[lo]), float(times[hi])
 
@@ -72,50 +78,71 @@ def hold(
   return end
 
 
-def _spike_times(
-  times: Float64Array, accel: Float64Array
-) -> tuple[Float64Array, Float64Array]:
-  """Peak time and robust z-score of each acceleration-norm run above ``_TAP_Z``."""
+@dataclass(frozen=True)
+class TapBurst:
+  start: float
+  strike: float  # First peak, the time used by the strict state writer.
+  end: float
+
+
+class _Spike(NamedTuple):
+  peak: float
+  slot: str
+  score: float
+  start: float
+  end: float
+
+
+def _spikes(times: Float64Array, accel: Float64Array, slot: str) -> list[_Spike]:
+  """Peak, camera, score and full sample bounds of each above-threshold run."""
   norm = np.linalg.norm(accel, axis=1)
   spread = 1.4826 * np.median(np.abs(norm - np.median(norm)))
   z = (norm - np.median(norm)) / spread
   above = np.concatenate(([False], z > _TAP_Z, [False]))
   edges = np.flatnonzero(np.diff(above.astype(np.int8)))
-  peaks = np.array(
-    [
-      lo + int(np.argmax(z[lo:hi]))
-      for lo, hi in zip(edges[::2], edges[1::2], strict=True)
-    ],
-    dtype=np.int64,
-  )
-  return times[peaks], z[peaks]
+  events = []
+  for lo, hi in zip(edges[::2], edges[1::2], strict=True):
+    peak = lo + int(np.argmax(z[lo:hi]))
+    events.append(
+      _Spike(
+        float(times[peak]), slot, float(z[peak]), float(times[lo]), float(times[hi - 1])
+      )
+    )
+  return events
 
 
-def tap(times: dict[str, Float64Array], accel: dict[str, Float64Array]) -> float:
-  """When the end tap starts; refuses a tap before the recording's last tenth."""
-  bursts: list[list[tuple[float, str, float]]] = [[]]
+def tap_burst(
+  times: dict[str, Float64Array], accel: dict[str, Float64Array]
+) -> TapBurst:
+  """Locate the strongest shared burst on the original sample clock."""
+  bursts: list[list[_Spike]] = [[]]
   for event in sorted(
-    (t, slot, score)
-    for slot in times
-    for t, score in zip(*_spike_times(times[slot], accel[slot]), strict=True)
+    e for slot in times for e in _spikes(times[slot], accel[slot], slot)
   ):
-    if bursts[-1] and event[0] - bursts[-1][-1][0] > _TAP_BURST_GAP:
+    if bursts[-1] and event.peak - bursts[-1][-1].peak > _TAP_BURST_GAP:
       bursts.append([])
     bursts[-1].append(event)
-  shared = [b for b in bursts if {e[1] for e in b} == set(times)]
+  shared = [b for b in bursts if {e.slot for e in b} == set(times)]
   if not shared:
     raise ValueError("no burst of acceleration spikes reaches every camera")
   strongest = max(
     shared,
-    key=lambda b: min(max(e[2] for e in b if e[1] == slot) for slot in times),
+    key=lambda b: min(max(e.score for e in b if e.slot == slot) for slot in times),
   )
+  return TapBurst(
+    min(e.start for e in strongest), strongest[0].peak, max(e.end for e in strongest)
+  )
+
+
+def tap(times: dict[str, Float64Array], accel: dict[str, Float64Array]) -> float:
+  """When the end tap starts; refuses a tap before the recording's final 20%."""
+  strike = tap_burst(times, accel).strike
   t0 = min(float(t[0]) for t in times.values())
   t1 = max(float(t[-1]) for t in times.values())
-  strike = strongest[0][0]
-  if strike < t0 + _TAP_TAIL * (t1 - t0):
+  if strike < t0 + TAP_TAIL * (t1 - t0):
     raise ValueError(
       f"the strongest tap burst sits at {(strike - t0) / (t1 - t0):.0%} of "
-      "the recording, before its last tenth"
+      f"the recording, before its final {1 - TAP_TAIL:.0%}"
     )
   return float(strike)
 

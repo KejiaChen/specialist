@@ -2,6 +2,7 @@
 
 import io
 import json
+import shutil
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
@@ -16,7 +17,12 @@ from specialist_dataset import schema
 from specialist_dataset.frames import LensVideo, decode_samples
 from specialist_dataset.read import Recording
 from specialist_dataset.state import HOLD_HEAD, hold
-from specialist_dataset.trim import TRIM_CONFIG, trim_dataset
+from specialist_dataset.trim import (
+  TRIM_CONFIG,
+  materialize_layers,
+  read_trim_plan,
+  trim_dataset,
+)
 
 from specialist.record.base import calibration_chunks, imu_chunks, write_base_recording
 from specialist.record.video import normalize_h264, video_chunks
@@ -166,21 +172,32 @@ def test_confirmed_hold_trim_keeps_sources_and_writes_a_synchronized_dataset(
   monkeypatch.setattr("sys.stdin", _Terminal("y\n"))
   output = tmp_path / "output"
   _state(late_dataset, output, margin=0.0)
-  trimmed = output.with_name(output.name + TRIM_CONFIG.output_suffix)
   assert _fingerprints(late_dataset) == originals
-  assert not output.exists()
-  report = json.loads((trimmed / "reports" / TRIM_CONFIG.report_name).read_text())
+  assert not output.with_name(output.name + TRIM_CONFIG.output_suffix).exists()
+  report = json.loads(
+    (output / TRIM_CONFIG.report_directory / TRIM_CONFIG.report_name).read_text()
+  )
   assert report["window_s"][0] > report["original_span_s"][0]
   assert report["video_decode_preroll_start_s"]
   stdout = capfd.readouterr().out
   assert "absolute video_time=" in stdout
   assert "%" in stdout
   assert "[y/N]" in stdout
+  assert {p.name for p in output.iterdir()} == {
+    TRIM_CONFIG.report_directory,
+    schema.state_layer(_SCALE, _F_ROW),
+  }
+  assert list((output / TRIM_CONFIG.report_directory).iterdir()) == [
+    output / TRIM_CONFIG.report_directory / TRIM_CONFIG.report_name
+  ]
+  replay = tmp_path / "temporary-replay"
+  layers, window = read_trim_plan(output)
+  materialize_layers(layers, replay, window, "sess")
   with (
-    Recording(schema.layer_rrd(trimmed, schema.BASE, "sess")) as base,
-    Recording(schema.layer_rrd(trimmed, schema.ESTIMATE, "sess")) as estimate,
+    Recording(schema.layer_rrd(replay, schema.BASE, "sess")) as base,
+    Recording(schema.layer_rrd(replay, schema.ESTIMATE, "sess")) as estimate,
     Recording(
-      schema.layer_rrd(trimmed, schema.state_layer(_SCALE, _F_ROW), "sess")
+      schema.layer_rrd(output, schema.state_layer(_SCALE, _F_ROW), "sess")
     ) as state,
   ):
     imu = {slot: base.scalars(schema.imu_signal(slot, "gyro"))[0] for slot in _SHIFT}
@@ -197,7 +214,7 @@ def test_confirmed_hold_trim_keeps_sources_and_writes_a_synchronized_dataset(
     assert base.property("RecordingInfo")["start_time"]
     assert estimate.property(schema.ESTIMATE)["git_sha"]
     assert _frames(state, "left")[3]
-  assert schema.layer_rrd(trimmed, schema.VIZ, "sess").exists()
+  assert schema.layer_rrd(replay, schema.VIZ, "sess").exists()
 
 
 @pytest.mark.parametrize("answer", ["n\n", "\n", "", "maybe\n"])
@@ -224,6 +241,32 @@ def test_noninteractive_late_hold_requires_explicit_confirmation(
   with pytest.raises(SystemExit, match="交互终端"):
     _state(late_dataset, tmp_path / "output", margin=0.0)
   assert not list(tmp_path.iterdir())
+
+
+def test_batch_auto_confirms_without_terminal(
+  late_dataset: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  monkeypatch.setenv("SPECIALIST_AUTO_CONFIRM_TRIM", "1")
+  monkeypatch.setattr("sys.stdin", io.StringIO(""))
+  # A populated reconstruction is also the state destination in normal batch use.
+  output = tmp_path / "trial"
+  shutil.copytree(late_dataset, output)
+  existing_layers = _fingerprints(output)
+  log = output / "reports" / "reconstruction.log"
+  log.parent.mkdir(exist_ok=True)
+  log.write_text("existing report")
+  state = _state(output, output, margin=0.0)
+  assert list(tmp_path.iterdir()) == [output]
+  assert log.read_text() == "existing report"
+  assert _fingerprints(output) == existing_layers
+  report = json.loads(
+    (output / TRIM_CONFIG.report_directory / TRIM_CONFIG.report_name).read_text()
+  )
+  assert report["source_layers"]["base"] == "base/sess.rrd"
+  assert state.is_file()
+  assert report["confirmation"] == "automatic"
+  with pytest.raises(SystemExit, match="overwrite"):
+    _state(output, output, margin=0.0)
 
 
 def test_failed_trimmed_state_publishes_nothing(

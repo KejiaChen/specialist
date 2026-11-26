@@ -164,6 +164,14 @@ def test_tap_dates_the_first_strike_of_the_strongest_shared_burst() -> None:
   assert tap(times, accel) == pytest.approx(96.0, abs=0.002)
 
 
+def test_tap_tail_includes_the_eighty_percent_boundary() -> None:
+  t = np.arange(10.0, 111.0)
+  times = {"cam00": t}
+  assert tap(times, {"cam00": _tapping(t, [90.0], 200.0)}) == 90.0
+  with pytest.raises(ValueError, match="before its final 20%"):
+    tap(times, {"cam00": _tapping(t, [89.0], 200.0)})
+
+
 def test_tap_accepts_a_simultaneous_pair() -> None:
   t = np.arange(0.0, 100.0, 0.001)
   times = {"cam00": t, "cam01": t}
@@ -181,5 +189,5 @@ def test_tap_refuses_a_one_sided_or_early_gesture() -> None:
   with pytest.raises(ValueError, match="reaches every camera"):
     tap(times, one_sided)
   early = {slot: _tapping(t, [50.0], 200.0) for slot in times}
-  with pytest.raises(ValueError, match="before its last tenth"):
+  with pytest.raises(ValueError, match="before its final 20%"):
     tap(times, early)
