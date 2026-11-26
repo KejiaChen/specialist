@@ -68,7 +68,7 @@ estimate/<session-id>.rrd      # the run's answers: poses, joint angles
 viz/<session-id>.rrd           # what is only drawn: ribbon, overlays
 assets/gripper-<sha>-<slot>.rrd # one slot's gripper model, shared by every session
 state_s8_r100/<session-id>.rrd  # what the policy sees: 360x360 images, 100 Hz state
-mocap/<session-id>.rrd         # ground-truth layer (eval branch)
+paired_mocap/<session-id>.rrd         # ground-truth layer (eval branch)
 ```
 
 **1. Convert.** Pass one `_00_` master `.insv` per camera; the converter finds

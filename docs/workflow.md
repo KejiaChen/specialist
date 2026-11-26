@@ -96,3 +96,12 @@ datasets/
 ```
 
 原始录像位于 `datasets/pick_cup_01/dual/trial_261116_001/`，处理结果会写到 `datasets/pick_cup_01/processed/dual/trial_261116_001/`。
+
+## 单机 X3 与 Vicon 批处理
+
+```bash
+bash scripts/pair_x3_vicon.sh --dataset 'datasets/<任务名>' --trials '<NNN>' \
+  --anchor-ids '<ID,ID,...>' --anchor-size '<anchor_size_m>'
+```
+
+配对状态见 `single/pairing/summary.csv`，匹配判据和重跑方法见[时间配对说明](temporal_pairing_with_vicon.md)。
