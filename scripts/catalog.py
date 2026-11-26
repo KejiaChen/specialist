@@ -20,6 +20,7 @@ from specialist_dataset.schema import (
   STATE,
   state_image,
 )
+from specialist_dataset.trim import read_trim_plan, trim_manifest_path
 
 from specialist.record.asset import register_assets
 from specialist.vi_ba.blueprint import state_blueprint, state_card_blueprint
@@ -100,7 +101,14 @@ def main(args: Args) -> None:
     entry = client.create_dataset(name)
   check_one_configuration(entry, args.state.name)
   register_all(entry, files, args.state.name)
-  register_assets(entry, args.state.parent)
+  asset_dataset = args.state.parent
+  if (
+    not (asset_dataset / "assets").is_dir()
+    and trim_manifest_path(asset_dataset).is_file()
+  ):
+    sources, _ = read_trim_plan(asset_dataset)
+    asset_dataset = sources["estimate"].parent.parent
+  register_assets(entry, asset_dataset)
 
   dashboard = state_blueprint()
   local = args.state.parent / "blueprints" / "state.rbl"

@@ -15,7 +15,7 @@ nvidia-smi -L
 
 如果终端找不到已安装的 `uv`，可运行 `source "$HOME/.local/bin/env"` 加载其路径。
 
-初次安装环境或锁定的依赖更新后，如果同级目录有 `specialist_description` 仓库，运行以下命令。脚本从该仓库读取锁定的夹爪模型版本。有 GitHub SSH 访问权限时，也可以直接执行 `uv sync --locked --python 3.14`。
+初次安装环境或锁定的依赖更新后，如果同级目录有 `specialist_description` 仓库，运行以下命令。脚本按本项目锁文件指定的版本从该本地仓库安装夹爪模型。有 GitHub SSH 访问权限时，也可以直接执行 `uv sync --locked --python 3.14`。
 
 ```bash
 ./scripts/sync-env.sh
@@ -48,28 +48,47 @@ install -Dm755 -- "$ffmpeg_path" tools/ffmpeg/bin/ffmpeg
 ln -s /media/umi/bd261add-2cbf-47e8-9592-bd5aca3d1314/specialist_data datasets
 ```
 
-同一任务更换采集布置时另建目录。下面是两套当前使用的布置，`pick_cup_01` 为双机，`pick_cup_02` 为单机。
+每个任务数据集按采集模式分为 `single/` 和 `dual/`。两种模式使用相同的四个子目录。下面以 11 月 25 日的任务为例。
 
 ```text
-datasets/
-├── pick_cup_01/
-│   ├── dual/
-│   │   └── trial_261116_001/
-│   │       ├── left/
-│   │       └── right/
-│   └── processed/
-│       └── recollect_20261116_1720/
-└── pick_cup_02/
-    ├── single/
-    │   ├── trial_261117_001/
-    │   └── trial_261117_002/
-    └── processed/
-        └── single_hand_201117/
+pick_and_place_261125/
+├── single/
+│   ├── raw/
+│   │   ├── x3/trial_261125_001/       # 同一台 X3 的两份 INSV
+│   │   └── vicon/                  # 原始 Vicon CSV
+│   ├── processed/
+│   │   └── trial_261125_001/        # 每条试次一个目录
+│   │       ├── base/、estimate/、viz/           # 完整重建层
+│   │       ├── assets/、blueprints/             # 回放资源
+│   │       ├── reports/                         # 重建及 state 运行日志
+│   │       ├── state_s8_r100/                   # 成功生成的训练 state
+│   │       └── state_trim_reports/hold_trim.json # 仅在需要裁剪时生成
+│   ├── pairing/                    # 最新 summary.csv、motive_csv、paired_mocap
+│   └── reconstruction/
+│       ├── history/                # 所有 run_*/ 运行目录
+│       ├── latest                  # 指向最近发布的 history/run_*/
+│       ├── reconstruction.csv      # 最近完成批次的清单
+│       └── summary.csv             # 最近一次评分表
+└── dual/
+    ├── raw/                        # 有双机数据时用 trial_YYMMDD_NNN/{right,left}/
+    ├── processed/
+    ├── pairing/
+    └── reconstruction/
 ```
 
-- **试次命名**采用 `trial_YYMMDD_NNN`，例如 `trial_261116_001` 表示 2026 年 11 月 16 日的第 001 条。同一布置的 `single` 和 `dual` 各自按采集日期编号。
-- **原始录像**放在 `single/<trial>/` 或 `dual/<trial>/{left,right}/`。每台相机的 `_00_` 和 `_10_` INSV 保留在同一目录。 [采集与存放说明](data_collection.doc)
-- **新处理结果**由脚本写到同一采集布置的 `processed/<mode>/<trial>/`。树中的 `recollect_20261116_1720/` 和 `single_hand_201117/` 是已有的处理批次。
+- **采集归档**按模式和日期编号。每台 X3 的 `_00_` 和 `_10_` 文件放在同一目录。当前 Vicon 配对和批量标定脚本处理单机数据，`--dataset` 传任务根目录，如 `datasets/pick_and_place_261125`。[采集说明](data_collection.doc)
+- **单条产物**在 `<模式>/processed/<trial>/`，训练 state 在该试次的 `state_s8_r100/<会话>.rrd`，需要裁剪时另存 `state_trim_reports/hold_trim.json`。更换锚点后的备用结果在 `single/processed/anchors_<配置>/<trial>/`。
+- **存储复用**：配对从 `processed/` 读取完整的 `base`，角速度匹配失败时查找已有 `estimate`。批量重建复用相同配置的轨迹和 state，标定读取轨迹和 state 时间窗。备用锚点的完整 base 和标定运行的 Vicon 输入优先使用硬链接，同一文件在多个目录中可见但只占一份磁盘空间。裁剪回放时从完整重建临时生成视频及轨迹，沿用原始视频时间，退出查看器后清理。[回放命令](process_and_reconstruct.md#7-回放)重跑配对时，字节相同的 CSV 和 RRD 继续使用现有文件。
+- **历史记录**在本批的 `single/pairing/history/`，原先的四个配对尝试目录按原名保留。迁移前的日志记录的是当时的路径；查看最近一批产物用 `single/reconstruction/reconstruction.csv`，最近一次评分见同目录 `summary.csv`。
+- **旧数据集**如 `pass_pen_01` 仍可按原目录处理。新任务的单机原片进入 `single/raw/x3/`，早期放在 `single/raw/trial_…/` 的数据也可读取。若该目录不存在且试次直接位于模式目录下，则使用旧布局。
+
+创建新任务时，在 Bash 中把任务名换成实际名称：
+
+```bash
+task="$PWD/datasets/<新任务名>"
+mkdir -p -- "$task"/{single,dual}/{raw,processed,pairing,reconstruction}
+mkdir -p -- "$task/single/raw"/{x3,vicon}
+```
 
 ## 处理并回放一条 trial
 
@@ -118,3 +137,16 @@ bash scripts/reconstruct_and_calibrate.sh --dataset 'datasets/<任务名>' --tri
 配对状态见 `single/pairing/summary.csv`，匹配判据和重跑方法见[时间配对说明](temporal_pairing_with_vicon.md)。
 
 最近完成批次的重建清单见 `single/reconstruction/reconstruction.csv`，最近一次评分见同目录的 `summary.csv`。轨迹复用规则和误差指标见[批量重建与标定说明](reconstruct_and_compare_with_vicon.md)。
+
+### 示例：用试次 048 标定，验证 049 和 050
+
+本例处理 `pick_and_place_261125` 的三条单机试次。场地锚点为 0、1、2，参考锚点为 0，标签内方形边长为 0.100 米。
+
+```bash
+ds="$PWD/datasets/pick_and_place_261125"
+bash scripts/pair_x3_vicon.sh --dataset "$ds" --trials {049..100} \
+  --anchor-ids 0,1,2 --anchor-size 0.100
+
+bash scripts/reconstruct_and_calibrate.sh --dataset "$ds" --trials {049..100} \
+  --anchor-ids 0,1,2 --anchor-size 0.100 --calibration 048
+```
