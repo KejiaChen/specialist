@@ -25,6 +25,12 @@ bash scripts/reconstruct_and_calibrate.sh \
 
 录制时使用双音标记的试次，在同一条命令中加上 `--state-boundary audio`。程序读取单机 `_00_` 原片，在第二声 1000 Hz 结束时开始，在 1600 Hz → 1200 Hz 的第一声响起时结束。支持 0.55 秒和 0.95 秒两个版本。每条试次需要一组顺序正确的开始音和结束音。缺失、重复或顺序错误时，该试次记为 `state_error`，候选时间可在日志中查看。
 
+现场播放用的 0.95 秒 WAV 文件在 [开始音](../assets/audio/x3-start-1000hz-950ms.wav) 和 [结束音](../assets/audio/x3-end-1600-1200hz-950ms.wav)。只检查某段原片里的标记时，可在项目根目录运行：
+
+```bash
+.venv/bin/python scripts/detect_x3_markers.py '<原片目录>/VID_..._00_196.insv'
+```
+
 音频模式直接取标记窗口与各训练数据流的共同覆盖区间，使用原视频时间轴。对应的 state 保存在试次目录下的 `audio_state/state_s8_r100/`。切换模式可复用同一条轨迹，重跑时按所选模式复用 state。Vicon 标定和验证使用该模式实际写出的训练时间窗。
 
 ## 参数
