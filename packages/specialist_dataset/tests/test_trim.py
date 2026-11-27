@@ -87,7 +87,7 @@ def test_early_tap_maximizes_window_while_retaining_both_gestures(
 
 
 def test_tail_cut_refuses_to_split_the_strongest_burst() -> None:
-  with pytest.raises(ValueError, match="full strongest Tap"):
+  with pytest.raises(ValueError, match="full repeated Tap burst"):
     hold_trim_window(
       [Hold(0.0, 1.0)], {"cam": np.arange(21.0)}, TapBurst(11.9, 12.0, 15.1)
     )

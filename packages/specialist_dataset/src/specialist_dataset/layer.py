@@ -11,6 +11,11 @@ from rerun.chunk import Chunk, LazyChunkStream, OptimizationProfile
 from rerun.urdf import UrdfTree
 
 from specialist_dataset import schema
+from specialist_dataset.state import (
+  OPENING_CLOSED_RAD,
+  OPENING_OPEN_RAD,
+  normalize_opening,
+)
 
 Float64Array = npt.NDArray[np.float64]
 Int64Array = npt.NDArray[np.int64]
@@ -65,6 +70,7 @@ def hand_chunks(
   # One image plane holds both hands, left then right.
   column = float(schema.HANDS.index(hand) * width)
   index = clock(t, rows)
+  normalized = normalize_opening(opening_rows)
   joints = {joint.name: joint for joint in tree.joints()}
   return [
     *[
@@ -76,7 +82,13 @@ def hand_chunks(
       for name, angle in zip(FINGER_JOINTS, (opening_rows, -opening_rows), strict=True)
     ],
     Chunk.from_columns(
-      schema.state_hand(hand), indexes=[], columns=rr.AnyValues.columns(slot=[slot])
+      schema.state_hand(hand),
+      indexes=[],
+      columns=rr.AnyValues.columns(
+        slot=[slot],
+        opening_closed_rad=[OPENING_CLOSED_RAD],
+        opening_open_rad=[OPENING_OPEN_RAD],
+      ),
     ),
     Chunk.from_columns(
       schema.state_image(hand),
@@ -113,7 +125,8 @@ def hand_chunks(
       for path, values in (
         (schema.state_lin_vel, lin_vel),
         (schema.state_ang_vel, ang_vel),
-        (schema.state_opening, opening_rows[:, None]),
+        (schema.state_opening, normalized[:, None]),
+        (schema.state_opening_rad, opening_rows[:, None]),
       )
     ],
   ]

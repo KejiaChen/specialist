@@ -129,10 +129,16 @@ Per hand, the layer holds:
   the fisheye disc, as one JPEG for every frame inside the usable window;
 - the gripper's base-tag pose and twist in the world frame on every row,
   interpolated between the estimate's samples;
-- the coupled finger angle.
+- the normalized gripper opening at `/state/<hand>/opening`, from 0 (pads touching)
+  to 1 (fully open). Each hand stores the model endpoints `opening_closed_rad`
+  (−0.1518) and `opening_open_rad` (0.6981). Values outside this range saturate.
+  The original coupled finger angle is available at `/state/<hand>/opening_rad`.
+  Older layers without `opening_rad` store radians in `opening`.
 
 The window comes from the operator's bracket gestures: a hold at the start and
-a tap at the end. `--margin` seconds stay clear of each. The writer finds which
+a burst of at least three taps at the end. The training window ends before the
+first impact begins. Detection runs once on the original recording. A hold ending after 20%
+or a first tap peak before 80% produces a timing warning. `--margin` defaults to one second on each side. The writer finds which
 camera rode which hand.
 
 A trainer indexes the layer by the integer `row` timeline, `round(t * --f-row)`.

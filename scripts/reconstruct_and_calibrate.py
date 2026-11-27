@@ -16,6 +16,7 @@ from pathlib import Path
 from checked_single_base import checked_base
 from dataset_layout import DatasetLayout
 from match_estimate import matches_anchors, recording
+from reconstruction_reports import publish_reports, read_table
 from specialist_dataset import schema
 from specialist_dataset.trim import TRIM_CONFIG
 
@@ -41,10 +42,21 @@ def args_from_cli():
     "--calibration", metavar="NNN", help="开启 Vicon 评估，仅用该试次拟合杆臂"
   )
   parser.add_argument(
+    "--overwrite-state",
+    action="store_true",
+    help="重新生成所选模式的 state，成功后覆盖旧文件",
+  )
+  parser.add_argument(
     "--pairing-dir", type=Path, help="配对结果，默认为数据集/single/pairing"
   )
   parser.add_argument(
     "--output-dir", type=Path, help="运行记录父目录，默认为数据集/single/reconstruction"
+  )
+  parser.add_argument(
+    "--state-boundary",
+    choices=("hold-tap", "audio"),
+    default="hold-tap",
+    help="训练窗口的起止标记，默认 hold-tap，audio 使用 X3 双音",
   )
   args = parser.parse_args()
   ids = args.anchor_ids.split(",")
@@ -114,8 +126,6 @@ def paired_inputs(pairing, args, run):
 
 
 def run_logged(command, logs, env):
-  # Both the new-reconstruction and state-only paths launch the same trim writer.
-  env = dict(env, SPECIALIST_AUTO_CONFIRM_TRIM="1")
   with subprocess.Popen(["tee", "-a", "--", *logs], stdin=subprocess.PIPE) as tee:
     result = subprocess.run(
       command, cwd=SCRIPTS.parent, env=env, stdout=tee.stdin, stderr=subprocess.STDOUT
@@ -125,9 +135,14 @@ def run_logged(command, logs, env):
   return result
 
 
-def state_result(estimate):
+def state_result(estimate, boundary="hold-tap"):
   folder = estimate.parent.parent
-  for dataset in (folder, folder.with_name(folder.name + TRIM_CONFIG.output_suffix)):
+  datasets = (
+    (folder / "audio_state",)
+    if boundary == "audio"
+    else (folder, folder.with_name(folder.name + TRIM_CONFIG.output_suffix))
+  )
+  for dataset in datasets:
     path = dataset / schema.state_layer(8, 100) / estimate.name
     if path.is_file():
       reader = recording(path, estimate.stem)
@@ -153,36 +168,45 @@ def state_result(estimate):
   return None
 
 
-def prepare_state(raw, estimate, reused, log):
+def prepare_state(raw, estimate, reused, log, boundary="hold-tap", overwrite=False):
   folder = estimate.parent.parent
   fd = os.open(raw, os.O_RDONLY)
   try:
     fcntl.flock(fd, fcntl.LOCK_EX)
-    existing = state_result(estimate)
-    if existing:
-      return ("reused" if reused else "built"), *existing
-    if not reused:
-      raise ValueError(f"重建已保存，未生成 state。见 {folder / 'reports/state.log'}")
+    if not overwrite:
+      existing = state_result(estimate, boundary)
+      if existing:
+        return ("reused" if reused else "built"), *existing
+      if not reused and boundary == "hold-tap":
+        raise ValueError(f"重建已保存，未生成 state。见 {folder / 'reports/state.log'}")
     report = folder / "reports/state.log"
     report.parent.mkdir(exist_ok=True)
+    destination = folder / "audio_state" if boundary == "audio" else folder
     command = [
       sys.executable,
       "-u",
-      str(SCRIPTS / "state_with_trim.py"),
+      str(SCRIPTS / "state.py"),
       "--base",
       folder / "base" / estimate.name,
       "--estimate",
       estimate,
       "--output-dir",
-      folder,
+      destination,
     ]
+    if overwrite:
+      command.append("--overwrite")
+    if boundary == "audio":
+      masters = list(raw.glob("*_00_*.insv"))
+      if len(masters) != 1:
+        raise ValueError(f"{raw}: 音频模式需要唯一的 _00_ 原片")
+      command.extend(["--audio-source", masters[0]])
     env = dict(
       os.environ,
       TMPDIR=str(folder),
       PATH=str(SCRIPTS.parent / "tools/ffmpeg/bin") + os.pathsep + os.environ["PATH"],
     )
     run_logged(command, [log.name, report], env).check_returncode()
-    result = state_result(estimate)
+    result = state_result(estimate, boundary)
     if not result:
       raise ValueError(f"未找到生成的训练 state：{folder}")
     return "built", *result
@@ -239,8 +263,9 @@ def reconstruct(ds, layout, n, args, log):
     args.anchor_ids,
     "--anchor-size",
     args.anchor_size,
-    "--state",
   ]
+  if args.state_boundary == "hold-tap" and not args.overwrite_state:
+    command.append("--state")
   env = dict(
     os.environ, SPECIALIST_DATA_ROOT=str(ds.parent), SPECIALIST_PROCESSED_ROOT=str(root)
   )
@@ -251,43 +276,32 @@ def reconstruct(ds, layout, n, args, log):
   return "built", estimate, raw
 
 
-def publish_reports(run, parent):
-  """Publish completed tables and point latest at their archived run."""
-  fd = os.open(parent, os.O_RDONLY)
-  try:
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    latest = parent / "latest"
-    if latest.exists() and not latest.is_symlink():
-      raise ValueError(f"latest 已被普通文件或目录占用：{latest}")
-    with tempfile.TemporaryDirectory(dir=parent, prefix=".reports_") as staging:
-      pending = Path(staging) / "latest"
-      pending.symlink_to(run.relative_to(parent), target_is_directory=True)
-      names = ["reconstruction.csv"]
-      if (run / "summary.csv").is_file():
-        names.append("summary.csv")
-      for name in names:
-        shutil.copy2(run / name, Path(staging) / name)
-      for name in names:
-        (Path(staging) / name).replace(parent / name)
-      pending.replace(latest)
-  finally:
-    os.close(fd)
-
-
 def batch(args):
   ds = args.dataset.resolve(strict=True)
   layout = DatasetLayout(ds, "single")
   pairing = (args.pairing_dir or layout.pairing).resolve(strict=True)
   parent = (args.output_dir or layout.reconstruction).resolve()
-  history = parent / "history"
-  history.mkdir(parents=True, exist_ok=True)
+  parent.mkdir(parents=True, exist_ok=True)
   run = Path(
-    tempfile.mkdtemp(prefix=datetime.now().strftime("run_%Y%m%d_%H%M%S_"), dir=history)
+    tempfile.mkdtemp(prefix=datetime.now().strftime("run_%Y%m%d_%H%M%S_"), dir=parent)
   )
   print(f"运行目录 {run}", flush=True)
   (run / "logs").mkdir()
   rows = paired_inputs(pairing, args, run)
   calibration = args.calibration
+  excluded = set()
+  exclusions_file = parent / "exclusions.csv"
+  if calibration and exclusions_file.is_file():
+    fields, entries = read_table(exclusions_file)
+    if "status" not in fields:
+      raise ValueError(f"排除表缺少 status 列：{exclusions_file}")
+    excluded = {
+      n for n, row in entries.items() if row["status"] == "excluded"
+    } & rows.keys()
+    if calibration in excluded:
+      raise ValueError(
+        f"指定标定试次 {calibration} 在 {exclusions_file} 中标为 excluded"
+      )
   if calibration and rows[calibration]["status"] != "pass":
     print(
       f"指定标定试次 {calibration} 的配对状态为 {rows[calibration]['status']}，"
@@ -298,7 +312,8 @@ def batch(args):
   (run / "parameters.txt").write_text(
     f"dataset={ds}\npairing={pairing}\ntrials={' '.join(rows)}\nanchor_ids={args.anchor_ids}\n"
     f"anchor_size_m={args.anchor_size}\nrequested_calibration={args.calibration or ''}\n"
-    f"calibration={calibration or ''}\n"
+    f"calibration={calibration or ''}\nstate_boundary={args.state_boundary}\n"
+    f"overwrite_state={args.overwrite_state}\nexcluded={' '.join(sorted(excluded))}\n"
   )
   layers, sync, records, windows = {}, {}, [], {}
   errors = False
@@ -314,6 +329,7 @@ def batch(args):
         "state_rrd",
         "state_start_s",
         "state_end_s",
+        "state_boundary",
       )
     )
     for n, row in rows.items():
@@ -338,7 +354,12 @@ def batch(args):
           log.flush()
           try:
             state_status, state, window = prepare_state(
-              raw, estimate, status == "reused", log
+              raw,
+              estimate,
+              status == "reused",
+              log,
+              args.state_boundary,
+              args.overwrite_state,
             )
             windows[n] = window
           except (
@@ -351,11 +372,23 @@ def batch(args):
             print(exc, file=log)
             errors = True
       writer.writerow(
-        (n, row["status"], status, estimate or "", state_status, state or "", *window)
+        (
+          n,
+          row["status"],
+          status,
+          estimate or "",
+          state_status,
+          state or "",
+          *window,
+          args.state_boundary,
+        )
       )
       f.flush()
       print(f"{n} {status}, state {state_status}", flush=True)
       if not calibration:
+        continue
+      if n in excluded:
+        records.append(dict(trial=n, status="excluded"))
         continue
       sync[n] = dict(sync=row["signal"], offset_s=row["offset_s"], corr=row["corr"])
       if estimate is None:

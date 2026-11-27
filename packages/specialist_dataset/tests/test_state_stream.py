@@ -11,8 +11,10 @@ from specialist_dataset.state import (
   lattice_brackets,
   lerp,
   nearest,
+  normalize_opening,
   opening,
   tap,
+  tap_burst,
 )
 
 Float64Array = npt.NDArray[np.float64]
@@ -52,6 +54,13 @@ def test_lattice_brackets_place_each_row_between_its_two_samples() -> None:
 def test_nearest_refuses_nothing_to_search() -> None:
   with pytest.raises(ValueError, match="no times"):
     nearest(np.array([]), np.array([1.0]))
+
+
+def test_normalize_opening_uses_fixed_endpoints_and_saturates() -> None:
+  angles = np.array([-1.0, -0.1518, (-0.1518 + 0.6981) / 2, 0.6981, 1.0])
+  np.testing.assert_allclose(normalize_opening(angles), [0.0, 0.0, 0.5, 1.0, 1.0])
+  with pytest.raises(ValueError, match="nonfinite"):
+    normalize_opening(np.array([np.nan]))
 
 
 def test_opening_is_half_the_mirrored_finger_difference() -> None:
@@ -152,42 +161,64 @@ def _tapping(t: Float64Array, at: list[float], magnitude: float) -> Float64Array
   return accel
 
 
-def test_tap_dates_the_first_strike_of_the_strongest_shared_burst() -> None:
+def test_tap_dates_the_last_repeated_shared_burst() -> None:
   t = np.arange(0.0, 100.0, 0.001)
   times = {"cam00": t, "cam01": t}
   accel = {
-    "cam00": _tapping(t, [10.0, 96.0, 96.3, 96.6, 98.5], 200.0),
-    "cam01": _tapping(t, [96.15, 96.45, 98.6], 200.0),
+    "cam00": _tapping(t, [10.0, 10.3, 10.6, 96.0, 96.3, 96.6, 98.5], 20.0),
+    "cam01": _tapping(t, [10.1, 10.4, 10.7, 96.15, 96.45, 96.75, 98.6], 20.0),
   }
-  accel["cam00"][np.abs(t - 98.5) < 0.003, 2] -= 160.0
-  accel["cam01"][np.abs(t - 98.6) < 0.003, 2] -= 160.0
+  for signal in accel.values():
+    signal[(t < 11.0) & (signal[:, 2] > 20.0), 2] += 180.0
   assert tap(times, accel) == pytest.approx(96.0, abs=0.002)
 
 
 def test_tap_tail_includes_the_eighty_percent_boundary() -> None:
-  t = np.arange(10.0, 111.0)
+  t = np.linspace(10.0, 110.0, 10001)
   times = {"cam00": t}
-  assert tap(times, {"cam00": _tapping(t, [90.0], 200.0)}) == 90.0
+  assert tap(times, {"cam00": _tapping(t, [90.0, 90.5, 91.0], 200.0)}) == 90.0
   with pytest.raises(ValueError, match="before its final 20%"):
-    tap(times, {"cam00": _tapping(t, [89.0], 200.0)})
+    tap(times, {"cam00": _tapping(t, [89.0, 89.5, 90.0], 200.0)})
 
 
-def test_tap_accepts_a_simultaneous_pair() -> None:
+@pytest.mark.parametrize(
+  "strikes",
+  [
+    [97.0],
+    [97.0, 97.3],
+    [97.0, 97.3, 97.32],
+    [97.0, 97.12, 97.29],
+    [97.0, 97.71, 98.01],
+  ],
+)
+def test_tap_requires_distinct_repeated_strikes_per_camera(
+  strikes: list[float],
+) -> None:
   t = np.arange(0.0, 100.0, 0.001)
   times = {"cam00": t, "cam01": t}
-  accel = {slot: _tapping(t, [97.0], 200.0) for slot in times}
-  assert tap(times, accel) == pytest.approx(97.0, abs=0.002)
+  accel = {slot: _tapping(t, strikes, 200.0) for slot in times}
+  with pytest.raises(ValueError, match="three distinct strikes"):
+    tap(times, accel)
+
+
+def test_single_camera_burst_keeps_first_peak_and_full_ringing_tail() -> None:
+  t = np.arange(1001) / 100.0
+  strikes = [3.0, 3.4, 8.37, 9.0, 9.21, 9.23, 9.95]
+  accel = _tapping(t, strikes, 20.0)
+  accel[t == 3.0, 2] += 200.0
+  burst = tap_burst({"cam00": t}, {"cam00": accel})
+  assert (burst.start, burst.strike, burst.end) == (8.37, 8.37, 9.23)
 
 
 def test_tap_refuses_a_one_sided_or_early_gesture() -> None:
   t = np.arange(0.0, 100.0, 0.001)
   times = {"cam00": t, "cam01": t}
   one_sided = {
-    "cam00": _tapping(t, [96.0, 96.3], 200.0),
-    "cam01": _tapping(t, [], 200.0),
+    "cam00": _tapping(t, [96.0, 96.3, 96.6], 200.0),
+    "cam01": _tapping(t, [96.3, 96.6], 200.0),
   }
-  with pytest.raises(ValueError, match="reaches every camera"):
+  with pytest.raises(ValueError, match="three distinct strikes on every camera"):
     tap(times, one_sided)
-  early = {slot: _tapping(t, [50.0], 200.0) for slot in times}
+  early = {slot: _tapping(t, [50.0, 50.3, 50.6], 200.0) for slot in times}
   with pytest.raises(ValueError, match="before its final 20%"):
     tap(times, early)

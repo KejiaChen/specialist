@@ -14,6 +14,7 @@ from specialist_dataset import schema
 from specialist_dataset.frames import LensVideo, decode_samples
 from specialist_dataset.layer import encode
 from specialist_dataset.read import Recording
+from specialist_dataset.state import TapBurst
 
 from specialist.record.base import (
   calibration_chunks,
@@ -53,7 +54,8 @@ def dataset(tmp_path_factory: pytest.TempPathFactory) -> Path:
   imu_t = np.arange(-1.0, 30.0, 0.005)
   accel = np.zeros((len(imu_t), 3))
   accel[:, 2] = 9.81 + 0.05 * np.sin(20.0 * imu_t)
-  accel[np.abs(imu_t - _STRIKE) < 0.003, 2] += 200.0
+  for strike in (_STRIKE, _STRIKE + 0.25, _STRIKE + 0.5):
+    accel[np.abs(imu_t - strike) < 0.003, 2] += 200.0
   insv = replace(
     synthetic_insv(),
     imu_timestamps=imu_t,
@@ -203,6 +205,7 @@ def test_the_state_is_the_base_tag_frame_on_a_dense_row_lattice(
       _, lin_vel = recording.scalars(schema.state_lin_vel(hand), 3)
       _, ang_vel = recording.scalars(schema.state_ang_vel(hand), 3)
       t_open, q = recording.scalars(schema.state_opening(hand), 1)
+      t_rad, angle = recording.scalars(schema.state_opening_rad(hand), 1)
       want = [expected[int(k)] for k in rows]
       np.testing.assert_allclose(t, rows / _F_ROW, atol=1e-9)
       # Float32 estimate rows set these tolerances; finite differences amplify them.
@@ -213,7 +216,9 @@ def test_the_state_is_the_base_tag_frame_on_a_dense_row_lattice(
       np.testing.assert_allclose(ang_vel, [w["ang_vel"] for w in want], atol=1e-4)
       # The opening lands on every row, interpolated from the solved finger angles.
       np.testing.assert_allclose(t_open, t, atol=1e-9)
-      np.testing.assert_allclose(q[:, 0], 0.1)
+      np.testing.assert_array_equal(t_rad, t_open)
+      np.testing.assert_allclose(angle[:, 0], 0.1)
+      np.testing.assert_allclose(q[:, 0], (0.1 + 0.1518) / (0.6981 + 0.1518))
 
 
 def test_each_hand_places_the_gripper_model(dataset: Path, tmp_path: Path) -> None:
@@ -249,6 +254,23 @@ def test_a_frame_whose_capture_row_leaves_the_state_rows_goes_for_both_hands(
       )
       np.testing.assert_array_equal(rows, [133, 167, 200, 233, 267])
       assert captured.min() >= 99
+
+
+def test_zero_margin_excludes_first_impact_from_poses_and_images(
+  dataset: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+  # The impact begins on a pose row and a camera frame, before its peak.
+  monkeypatch.setattr(
+    "scripts.state.tap_burst", lambda *_args, **_kwargs: TapBurst(0.2, 0.21, 0.8)
+  )
+  out = _state(dataset, tmp_path, margin=0.0)
+  with Recording(out) as recording:
+    for hand in schema.HANDS:
+      pose_times, _ = recording.values(
+        schema.state_pose(hand), schema.POSE_TRANSLATION, 3
+      )
+      assert pose_times[-1] == pytest.approx(0.199)
+      assert _frames(recording, hand)[0].max() < 200_000_000
 
 
 def test_the_margin_trims_the_window(dataset: Path, tmp_path: Path) -> None:

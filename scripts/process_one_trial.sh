@@ -11,8 +11,7 @@ usage() {
 --state   同时生成训练 state
 --replay  处理结束后打开 Rerun
 
---state 发现 Hold 超出前 10% 或最强 Tap 早于最后 20% 时，会显示百分比和绝对秒数并请求确认；
-确认后将裁剪清单和 state 存入试次目录，回放时按需生成裁剪层。
+--state 在原片上检测一次 Hold/Tap。Hold 结束晚于 20% 或 Tap 首峰早于 80% 时记录警告。
 
 开发环境和日常用法见 docs/workflow.md。执行步骤和日志说明见 docs/process_and_reconstruct.md。
 EOF
@@ -267,16 +266,13 @@ reports="$output/reports"
 scratch="$(mktemp -d -- "$output_parent/.$trial.state.XXXXXXXX")"
 trap 'rm -rf -- "$scratch"' EXIT
 state_failed=false
-replay_args=()
 if $write_state; then
   if ! run_step '训练 state' state.log env TMPDIR="$scratch" uv run --no-sync \
-    python scripts/state_with_trim.py --base "$output/base/$session.rrd" \
+    python scripts/state.py --base "$output/base/$session.rrd" \
     --estimate "$output/estimate/$session.rrd" --output-dir "$output"; then
     state_failed=true
   elif [[ ! -s "$output/state_s8_r100/$session.rrd" ]]; then
     state_failed=true
-  elif [[ -f "$output/state_trim_reports/hold_trim.json" ]]; then
-    replay_args=(--trim)
   fi
 fi
 rm -rf -- "$scratch"
@@ -285,13 +281,9 @@ exec {trial_lock}<&-
 
 asset="$output/assets/${assets[0]##*/}"
 printf '重建结果 %s\n' "$output"
-if (( ${#replay_args[@]} )); then
-  printf '裁剪及训练 state %s\n' "$dataset"
-fi
 printf '回放命令\n'
 printf 'SPECIALIST_DATASET=%q SPECIALIST_SESSION=%q SPECIALIST_ASSET=%q %q' \
   "$dataset" "$session" "$asset" "$root/scripts/view-reconstruction.sh"
-if (( ${#replay_args[@]} )); then printf ' %q' "${replay_args[@]}"; fi
 printf '\n'
 if $state_failed; then
   echo "重建已保存。训练 state 失败，日志见 $output/reports/state.log。" >&2
@@ -299,5 +291,5 @@ if $state_failed; then
 fi
 if $replay; then
   SPECIALIST_DATASET="$dataset" SPECIALIST_SESSION="$session" SPECIALIST_ASSET="$asset" \
-    exec "$root/scripts/view-reconstruction.sh" "${replay_args[@]}"
+    exec "$root/scripts/view-reconstruction.sh"
 fi

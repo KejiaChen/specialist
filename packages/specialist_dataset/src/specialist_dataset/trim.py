@@ -89,7 +89,7 @@ def hold_trim_window(
       return float(start), float(end)
   raise ValueError(
     f"the common crop must retain at least {HOLD_MIN_DURATION} s of every Hold "
-    f"in the first tenth and the full strongest Tap, with its first peak in the final {1 - TAP_TAIL:.0%}"
+    f"in the first tenth and the full repeated Tap burst, with its first peak in the final {1 - TAP_TAIL:.0%}"
   )
 
 

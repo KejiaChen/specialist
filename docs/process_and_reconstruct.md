@@ -86,13 +86,13 @@ mkdir -p -- "$dataset/reports" &&
 
 完整脚本在传入 `--state` 时执行本步；不加该参数只做重建，不检查 Hold/Tap。单独运行时使用同一会话的 `base` 和 `estimate`。成功后生成 `state_s8_r100/<session_id>.rrd`。检查失败时看 `reports/state.log`。 [state 命令](../scripts/process_one_trial.sh#L270)
 
-[state_with_trim.py](../scripts/state_with_trim.py) 从整段 IMU 合加速度中检测 Tap。相邻候选峰间隔 ≤ 0.5 秒就归成一组。单机选含最高峰的一组，一个峰也可入选。双机只比较两台相机都检出的组，以两台相机各自最高峰得分中的较低值评比。选中组的**首峰**作为 Tap 时间。
+[state.py](../scripts/state.py) 从整段 IMU 合加速度中检测 Tap。采集结束时连续敲击三次。同一相机上相邻候选峰间隔小于 0.08 秒时合并为一次敲击，取首峰计时，以抑制振铃。将各相机的敲击按时间排序，相邻间隔 ≤ 0.7 秒就归为一组。同一相机从组首开始计数，距上一次计入的峰至少 0.20 秒才算下一击。从后往前选择第一组每台相机都至少检出三次敲击的记录，以该组**首峰**作为 Tap 时间。找不到三击组时，state 检查失败。
 
-每台相机的 Hold 结束点须在区间前 10%，Tap 首峰须在后 20%。若原片不满足比例，脚本寻找符合条件的最长共同窗口，同时保留每台相机至少 0.4 秒连续 Hold 和整组 Tap。找到后，单独运行默认提示 `[y/N]`，输入 `y`、`yes` 或 `是` 确认。批处理 `reconstruct_and_calibrate.sh` 自动确认。找不到窗口时可在 `reports/state.log` 查看原因。
+在原片上检测一次手势。任一相机的 Hold 结束晚于原始 IMU 时段的 20%，或最后一组 Tap 的首峰早于 80%，会记录警告并继续生成 state。日志给出事件时间及其在原片中的百分比。
 
-确认后临时裁剪 `base` 和 `estimate` 供 state 计算，沿用原视频时间戳。为支持解码，视频可能比轨迹多保留一小段前导帧。[state.py](../scripts/state.py) 会重新检测手势，在 Hold 结束后和 Tap 首峰前各留 1 秒，并取各数据流共同覆盖的时段生成训练 state。检查通过后，脚本把训练 state 写入本试次的 `state_s8_r100/<会话>.rrd`（默认配置），把裁剪清单写入 `state_trim_reports/hold_trim.json`。原片已满足比例时只生成 state。清单记录完整重建的位置、裁剪区间和手势；运行日志保存在完整重建的 `reports/state.log`。单条脚本已保存重建但 state 失败时，退出码为 3。
+默认训练窗口从最后一台相机的 Hold 结束后 1 秒到整组 Tap 开始前 1 秒，取各数据流的共同覆盖区间。即使设定 `--margin 0`，训练行和图像也必须早于第一次敲击的起始采样点。缺少有效手势、手势顺序错误或有效训练区间为空时，该试次失败。成功的 state 保存在 `state_s8_r100/<会话>.rrd`，单条脚本的日志在 `reports/state.log`。
 
-如果 `process_one_trial.sh` 处理后再单独生成训练 state，直接使用它的产物目录作为 `dataset`。`tee -a` 会把本次输出追加到 `reports/state.log`，首次运行时会创建该文件。在交互终端执行，方便确认裁剪。
+如果 `process_one_trial.sh` 处理后再单独生成训练 state，直接使用它的产物目录作为 `dataset`。已有旧版 Tap 规则生成的 state 时，在下面的命令中加 `--overwrite` 可复用轨迹，按三击规则重新生成 state。`tee -a` 会把本次输出追加到 `reports/state.log`，首次运行时会创建该文件。
 
 ```bash
 cd ~/specialist-reconstruction/specialist
@@ -100,7 +100,7 @@ cd ~/specialist-reconstruction/specialist
 # session='20261125_143633_IAQEB260436VUM'
 set -o pipefail
 
-TMPDIR="$dataset" uv run --no-sync python scripts/state_with_trim.py \
+TMPDIR="$dataset" uv run --no-sync python scripts/state.py \
   --base "$dataset/base/$session.rrd" --estimate "$dataset/estimate/$session.rrd" \
   --output-dir "$dataset" \
   2>&1 | tee -a "$dataset/reports/state.log"
@@ -111,7 +111,7 @@ TMPDIR="$dataset" uv run --no-sync python scripts/state_with_trim.py \
 ```bash
 dataset="$PWD/datasets/pass_pen_01/processed/dual/trial_261120_002"
 session='20261120_173242_IAQEB260436VUM'
-uv run --no-sync python scripts/state_with_trim.py \
+uv run --no-sync python scripts/state.py \
   --base "$dataset/base/$session.rrd" \
   --estimate "$dataset/estimate/$session.rrd" \
   --output-dir "$dataset"
@@ -119,7 +119,7 @@ uv run --no-sync python scripts/state_with_trim.py \
 
 ## 7. 回放
 
-设置 `SPECIALIST_DATASET` 后运行同一个回放脚本。指向试次目录，默认回放全段。加 `--trim` 可按该试次的裁剪清单临时生成 `base`、`estimate` 和 `viz`，共用完整重建的模型和蓝图。例如回放 087 的裁剪段：
+设置 `SPECIALIST_DATASET` 后运行同一个回放脚本。指向试次目录，默认回放全段。对于留有历史裁剪清单的试次，加 `--trim` 可按该清单临时生成 `base`、`estimate` 和 `viz`，共用完整重建的模型和蓝图。例如回放 087 的裁剪段：
 
 ```bash
 cd ~/specialist-reconstruction/specialist

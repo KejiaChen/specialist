@@ -1,8 +1,6 @@
-"""Confirmed whole-dataset Hold crops around the unchanged state writer."""
+"""Original-clock state generation and replay of historical crops."""
 
 import io
-import json
-import shutil
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
@@ -10,17 +8,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 from rerun.chunk import RrdReader
-from scripts.state import Args, gripper_state
+from scripts.state import Args, warn_gesture_timing
 from scripts.state import main as strict_main
 from scripts.state_with_trim import main
 from specialist_dataset import schema
 from specialist_dataset.frames import LensVideo, decode_samples
 from specialist_dataset.read import Recording
-from specialist_dataset.state import HOLD_HEAD, hold
 from specialist_dataset.trim import (
   TRIM_CONFIG,
-  materialize_layers,
-  read_trim_plan,
   trim_dataset,
 )
 
@@ -61,7 +56,8 @@ def _make_dataset(root: Path, imu_start: float = -1.0) -> Path:
   imu_t = np.arange(imu_start, 30.0, 0.005)
   accel = np.zeros((len(imu_t), 3))
   accel[:, 2] = 9.81 + 0.05 * np.sin(20.0 * imu_t)
-  accel[np.abs(imu_t - _STRIKE) < 0.003, 2] += 200.0
+  for strike in (_STRIKE, _STRIKE + 0.25, _STRIKE + 0.5):
+    accel[np.abs(imu_t - strike) < 0.003, 2] += 200.0
   insv = replace(
     synthetic_insv(),
     imu_timestamps=imu_t,
@@ -98,11 +94,6 @@ def _state(dataset: Path, out_dir: Path, **kwargs: object) -> Path:
   return schema.layer_rrd(out_dir, schema.state_layer(_SCALE, _F_ROW), "sess")
 
 
-class _Terminal(io.StringIO):
-  def isatty(self) -> bool:
-    return True
-
-
 def _fingerprints(root: Path) -> dict[str, str]:
   return {
     layer: sha256(schema.layer_rrd(root, layer, "sess").read_bytes()).hexdigest()
@@ -110,20 +101,21 @@ def _fingerprints(root: Path) -> dict[str, str]:
   }
 
 
-def test_original_writer_still_refuses_a_late_hold(
-  late_dataset: Path,
-  tmp_path: Path,
-) -> None:
-  with pytest.raises(SystemExit, match="past its first tenth"):
-    strict_main(
-      Args(
-        base=schema.layer_rrd(late_dataset, schema.BASE, "sess"),
-        output_dir=tmp_path,
-        urdf_path=late_dataset / "robot.urdf",
-        margin=0.0,
-      )
-    )
-  assert not list(tmp_path.iterdir())
+@pytest.mark.parametrize(
+  ("hold_end", "tap_peak", "messages"),
+  [
+    (30.0, 90.0, []),
+    (30.001, 90.0, ["cam00 Hold"]),
+    (30.0, 89.999, ["Tap 首峰"]),
+    (31.0, 89.0, ["cam00 Hold", "Tap 首峰"]),
+  ],
+)
+def test_timing_warnings_on_original_clock(hold_end, tap_peak, messages, capsys):
+  warn_gesture_timing((10.0, 110.0), {"cam00": hold_end}, tap_peak)
+  warnings = capsys.readouterr().err.splitlines()
+  assert len(warnings) == len(messages)
+  for warning, message in zip(warnings, messages, strict=True):
+    assert message in warning
 
 
 def test_wrapper_preserves_the_original_state_for_an_on_time_hold(
@@ -162,124 +154,42 @@ def test_wrapper_preserves_the_original_state_for_an_on_time_hold(
         np.testing.assert_array_equal(actual, expected)
 
 
-def test_confirmed_hold_trim_keeps_sources_and_writes_a_synchronized_dataset(
-  late_dataset: Path,
-  tmp_path: Path,
-  monkeypatch: pytest.MonkeyPatch,
-  capfd: pytest.CaptureFixture[str],
-) -> None:
-  originals = _fingerprints(late_dataset)
-  monkeypatch.setattr("sys.stdin", _Terminal("y\n"))
-  output = tmp_path / "output"
-  _state(late_dataset, output, margin=0.0)
-  assert _fingerprints(late_dataset) == originals
-  assert not output.with_name(output.name + TRIM_CONFIG.output_suffix).exists()
-  report = json.loads(
-    (output / TRIM_CONFIG.report_directory / TRIM_CONFIG.report_name).read_text()
-  )
-  assert report["window_s"][0] > report["original_span_s"][0]
-  assert report["video_decode_preroll_start_s"]
-  stdout = capfd.readouterr().out
-  assert "absolute video_time=" in stdout
-  assert "%" in stdout
-  assert "[y/N]" in stdout
-  assert {p.name for p in output.iterdir()} == {
-    TRIM_CONFIG.report_directory,
-    schema.state_layer(_SCALE, _F_ROW),
-  }
-  assert list((output / TRIM_CONFIG.report_directory).iterdir()) == [
-    output / TRIM_CONFIG.report_directory / TRIM_CONFIG.report_name
-  ]
-  replay = tmp_path / "temporary-replay"
-  layers, window = read_trim_plan(output)
-  materialize_layers(layers, replay, window, "sess")
-  with (
-    Recording(schema.layer_rrd(replay, schema.BASE, "sess")) as base,
-    Recording(schema.layer_rrd(replay, schema.ESTIMATE, "sess")) as estimate,
-    Recording(
-      schema.layer_rrd(output, schema.state_layer(_SCALE, _F_ROW), "sess")
-    ) as state,
-  ):
-    imu = {slot: base.scalars(schema.imu_signal(slot, "gyro"))[0] for slot in _SHIFT}
-    span = (min(t[0] for t in imu.values()), max(t[-1] for t in imu.values()))
-    for slot in _SHIFT:
-      gripper = gripper_state(estimate, slot)
-      end = hold(
-        gripper[0],
-        np.linalg.norm(gripper[1], axis=1),
-        np.linalg.norm(gripper[3], axis=1),
-        span,
-      )
-      assert (end - span[0]) / (span[1] - span[0]) <= HOLD_HEAD
-    assert base.property("RecordingInfo")["start_time"]
-    assert estimate.property(schema.ESTIMATE)["git_sha"]
-    assert _frames(state, "left")[3]
-  assert schema.layer_rrd(replay, schema.VIZ, "sess").exists()
+def test_late_hold_builds_once_without_crop_or_confirmation(
+  late_dataset, tmp_path, monkeypatch, capfd
+):
+  import scripts.state as writer
 
+  calls = []
+  detect = writer.tap_burst
 
-@pytest.mark.parametrize("answer", ["n\n", "\n", "", "maybe\n"])
-def test_declined_hold_trim_publishes_nothing(
-  late_dataset: Path,
-  tmp_path: Path,
-  monkeypatch: pytest.MonkeyPatch,
-  answer: str,
-) -> None:
-  originals = _fingerprints(late_dataset)
-  monkeypatch.setattr("sys.stdin", _Terminal(answer))
-  with pytest.raises(SystemExit, match="已取消裁剪"):
-    _state(late_dataset, tmp_path / "output", margin=0.0)
-  assert not list(tmp_path.iterdir())
-  assert _fingerprints(late_dataset) == originals
+  def track_detection(*args, **kwargs):
+    calls.append(1)
+    return detect(*args, **kwargs)
 
-
-def test_noninteractive_late_hold_requires_explicit_confirmation(
-  late_dataset: Path,
-  tmp_path: Path,
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
-  monkeypatch.setattr("sys.stdin", io.StringIO("y\n"))
-  with pytest.raises(SystemExit, match="交互终端"):
-    _state(late_dataset, tmp_path / "output", margin=0.0)
-  assert not list(tmp_path.iterdir())
-
-
-def test_batch_auto_confirms_without_terminal(
-  late_dataset: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-  monkeypatch.setenv("SPECIALIST_AUTO_CONFIRM_TRIM", "1")
+  monkeypatch.setattr(writer, "tap_burst", track_detection)
   monkeypatch.setattr("sys.stdin", io.StringIO(""))
-  # A populated reconstruction is also the state destination in normal batch use.
-  output = tmp_path / "trial"
-  shutil.copytree(late_dataset, output)
-  existing_layers = _fingerprints(output)
-  log = output / "reports" / "reconstruction.log"
-  log.parent.mkdir(exist_ok=True)
-  log.write_text("existing report")
-  state = _state(output, output, margin=0.0)
-  assert list(tmp_path.iterdir()) == [output]
-  assert log.read_text() == "existing report"
-  assert _fingerprints(output) == existing_layers
-  report = json.loads(
-    (output / TRIM_CONFIG.report_directory / TRIM_CONFIG.report_name).read_text()
-  )
-  assert report["source_layers"]["base"] == "base/sess.rrd"
-  assert state.is_file()
-  assert report["confirmation"] == "automatic"
-  with pytest.raises(SystemExit, match="overwrite"):
-    _state(output, output, margin=0.0)
-
-
-def test_failed_trimmed_state_publishes_nothing(
-  late_dataset: Path,
-  tmp_path: Path,
-  monkeypatch: pytest.MonkeyPatch,
-) -> None:
   originals = _fingerprints(late_dataset)
-  monkeypatch.setattr("sys.stdin", _Terminal("yes\n"))
-  with pytest.raises(SystemExit, match="window"):
-    _state(late_dataset, tmp_path / "output", margin=100.0)
-  assert not list(tmp_path.iterdir())
+  state = _state(late_dataset, tmp_path, margin=0.0)
+  assert calls == [1]
+  assert state.is_file()
+  assert "cam00 Hold" in capfd.readouterr().err
+  assert list(tmp_path.iterdir()) == [state.parent]
   assert _fingerprints(late_dataset) == originals
+
+
+def test_overwrite_retires_old_crop_only_after_success(late_dataset, tmp_path):
+  state = _state(late_dataset, tmp_path, margin=0.0)
+  manifest = tmp_path / TRIM_CONFIG.report_directory / TRIM_CONFIG.report_name
+  manifest.parent.mkdir()
+  manifest.write_text('{"source_layers": {"base": "base/sess.rrd"}}')
+  old_bytes = state.read_bytes()
+  with pytest.raises(SystemExit, match="window"):
+    _state(late_dataset, tmp_path, margin=100.0, overwrite=True)
+  assert state.read_bytes() == old_bytes and manifest.exists()
+  with pytest.raises(SystemExit, match="overwrite"):
+    _state(late_dataset, tmp_path, margin=0.0)
+  _state(late_dataset, tmp_path, margin=0.0, overwrite=True)
+  assert state.is_file() and not manifest.exists()
 
 
 def test_synchronized_crop_preserves_video_keyframe_preroll(

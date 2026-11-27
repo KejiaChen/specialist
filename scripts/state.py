@@ -5,6 +5,9 @@ Usage:
         --output-dir dataset
 """
 
+import fcntl
+import json
+import os
 import sys
 import tempfile
 from collections import deque
@@ -37,14 +40,16 @@ from specialist_dataset.read import Recording, read_anchors, read_keyframe_poses
 from specialist_dataset.state import (
   finger,
   hands,
-  hold,
+  hold_interval,
   image_frames,
   lattice_brackets,
   lerp,
   opening,
-  tap,
+  tap_burst,
 )
+from specialist_dataset.trim import trim_manifest_path
 
+from specialist.loader.audio_markers import video_marker_window
 from specialist.record.asset import resolve_urdf_path, urdf_sha
 from specialist.record.layer import git_sha
 from specialist.record.session import SessionRecording, fps_from_times
@@ -84,6 +89,9 @@ class Args:
 
   # Replace an existing layer.
   overwrite: bool = False
+
+  # Original single-camera master INSV carrying the start/end markers.
+  audio_source: Path | None = None
 
 
 @contextmanager
@@ -229,23 +237,21 @@ def gripper_state(estimate: Recording, slot: str) -> State:
 
 
 def usable_window(
-  hold_ends: list[float],
-  strike: float,
-  margin: float,
+  boundaries: tuple[float, float],
   times: dict[str, Float64Array],
   keyframes: dict[str, Float64Array],
   fingers: dict[str, tuple[Any, Any]],
 ) -> tuple[float, float]:
-  """The kept span, a margin inside the hold and strike and covered by every series."""
+  """Intersect the requested training boundaries with every series."""
   return (
     max(
-      max(hold_ends) + margin,
+      boundaries[0],
       max(float(t[0]) for t in times.values()),
       max(k[0] for k in keyframes.values()),
       max(float(t[0]) for pair in fingers.values() for t, _ in pair),
     ),
     min(
-      strike - margin,
+      boundaries[1],
       min(float(t[-1]) for t in times.values()),
       min(k[-1] for k in keyframes.values()),
       min(float(t[-1]) for pair in fingers.values() for t, _ in pair),
@@ -303,7 +309,8 @@ def layer_account(
     "scale": args.scale,
     "mask_radius": MASK_RADIUS,
     "side": _LENS,
-    "margin": args.margin,
+    "margin": args.margin if args.audio_source is None else 0.0,
+    "state_boundary": "hold-tap" if args.audio_source is None else "audio",
     "duration": window[1] - window[0],
     "kept": (window[1] - window[0]) / covered,
     "git_sha": git_sha(),
@@ -314,6 +321,62 @@ def layer_account(
     "estimated_at": _one(run["estimated_at"]),
     "written_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
   }
+
+
+def warn_gesture_timing(
+  span: tuple[float, float], hold_ends: dict[str, float], tap_peak: float
+) -> None:
+  start, end = span
+  duration = end - start
+  for slot, instant in hold_ends.items():
+    if instant > start + 0.2 * duration:
+      print(
+        f"警告：{slot} Hold 结束于 {instant:.6f} s（原片 {(instant - start) / duration:.2%}），晚于 20%。",
+        file=sys.stderr,
+      )
+  if tap_peak < start + 0.8 * duration:
+    print(
+      f"警告：Tap 首峰位于 {tap_peak:.6f} s（原片 {(tap_peak - start) / duration:.2%}），早于 80%。",
+      file=sys.stderr,
+    )
+
+
+def publish_state(
+  path: Path,
+  session_id: str,
+  account: dict[str, Any],
+  chunks: list[Chunk],
+  overwrite: bool,
+) -> None:
+  destination = path.parent.parent
+  destination.mkdir(parents=True, exist_ok=True)
+  lock = os.open(destination, os.O_RDONLY)
+  try:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    if path.exists() and not overwrite:
+      raise SystemExit(f"{path} exists; pass --overwrite to replace it")
+    manifest = trim_manifest_path(destination)
+    if manifest.is_file():
+      source = Path(json.loads(manifest.read_text())["source_layers"]["base"])
+      # Keep historical replay information while another layer still uses it.
+      if source.stem == session_id and not any(
+        other != path for other in destination.glob(f"state_s*_r*/{path.name}")
+      ):
+        with tempfile.TemporaryDirectory(dir=destination) as staging:
+          staged = Path(staging) / path.name
+          write_layer(staged, session_id, account, chunks)
+          path.parent.mkdir(exist_ok=True)
+          backup = Path(staging) / "previous-manifest.json"
+          manifest.replace(backup)
+          try:
+            staged.replace(path)
+          except OSError:
+            backup.replace(manifest)
+            raise
+        return
+    write_layer(path, session_id, account, chunks)
+  finally:
+    os.close(lock)
 
 
 def main(args: Args) -> None:
@@ -352,33 +415,56 @@ def main(args: Args) -> None:
   urdf = resolve_urdf_path(args.urdf_path)
   estimate = Recording(estimate_path)
   digest = same_urdf(estimate, slots, urdf)
-  anchors = np.stack(
-    [pose[:3, 3] for pose in read_anchors(estimate_path).poses.values()]
-  )
-  imus = {slot: session.imu(slot) for slot in slots}
-  span = (
-    min(float(imu.t[0]) for imu in imus.values()),
-    max(float(imu.t[-1]) for imu in imus.values()),
-  )
   grippers: dict[str, State] = {}
   fingers: dict[str, tuple[Any, Any]] = {}
-  hold_ends: list[float] = []
   for slot in slots:
     with refusing(slot):
       fingers[slot] = finger_pair(estimate, slot)
-      gripper = grippers[slot] = gripper_state(estimate, slot)
-      distance = np.linalg.norm(gripper[1][:, None] - anchors[None], axis=2).min(axis=1)
-      hold_ends.append(
-        hold(gripper[0], distance, np.linalg.norm(gripper[3], axis=1), span)
-      )
+      grippers[slot] = gripper_state(estimate, slot)
   lap("gripper states")
-  with refusing():
-    strike = tap(
-      {slot: imu.t for slot, imu in imus.items()},
-      {slot: imu.accel for slot, imu in imus.items()},
+  if args.audio_source is not None:
+    if len(slots) != 1:
+      raise SystemExit("音频标记模式需要单机 X3 录像")
+    with Recording(args.base) as base:
+      capture = base.row(schema.camera(slots[0]))
+    if _one(capture.get("source", [""])) != args.audio_source.name:
+      raise SystemExit(f"音频原片与 base 的来源不匹配：{args.audio_source}")
+    with refusing():
+      start, end = video_marker_window(args.audio_source)
+    shift = float(_one(capture["clock_shift"]))
+    boundaries = (start + shift, end + shift)
+    print(
+      f"音频标记 {args.audio_source.name}: {boundaries[0]:.3f} .. {boundaries[1]:.3f} s"
     )
+  else:
+    anchors = np.stack([p[:3, 3] for p in read_anchors(estimate_path).poses.values()])
+    imus = {slot: session.imu(slot) for slot in slots}
+    span = (
+      min(float(i.t[0]) for i in imus.values()),
+      max(float(i.t[-1]) for i in imus.values()),
+    )
+    hold_ends = {}
+    for slot, gripper in grippers.items():
+      with refusing(slot):
+        distance = np.linalg.norm(gripper[1][:, None] - anchors[None], axis=2).min(
+          axis=1
+        )
+        _, hold_ends[slot] = hold_interval(
+          gripper[0], distance, np.linalg.norm(gripper[3], axis=1)
+        )
+    with refusing():
+      burst = tap_burst(
+        {slot: i.t for slot, i in imus.items()},
+        {slot: i.accel for slot, i in imus.items()},
+      )
+    warn_gesture_timing(span, hold_ends, burst.strike)
+    last_hold = max(hold_ends.values())
+    if last_hold >= burst.start:
+      raise SystemExit("Hold 必须在 Tap 开始前结束，无法形成训练窗口")
+    # Exclude the first impact sample even when the requested margin is zero.
+    boundaries = (last_hold + args.margin, burst.start - max(args.margin, 1e-9))
 
-  window = usable_window(hold_ends, strike, args.margin, times, keyframes, fingers)
+  window = usable_window(boundaries, times, keyframes, fingers)
   lap("window")
   with refusing():
     frames = image_frames(times, fps, window)
@@ -396,6 +482,13 @@ def main(args: Args) -> None:
   )
   account = layer_account(args, estimate, digest, session, layer, window, covered)
 
+  if args.audio_source is not None:
+    account.update(
+      audio_source=args.audio_source.name,
+      marker_start_s=boundaries[0],
+      marker_end_s=boundaries[1],
+    )
+
   states: dict[str, tuple[Int64Array, State]] = {}
   for slot in slots:
     with refusing(slot):
@@ -403,6 +496,10 @@ def main(args: Args) -> None:
   lo = max(int(rows[0]) for rows, _ in states.values())
   hi = min(int(rows[-1]) for rows, _ in states.values())
   kept = frames_on_rows(times, frames, fps, args.f_row, lo, hi)
+  if args.audio_source is None:
+    # Frame labels and capture rows are rounded. Check the actual capture clock too.
+    for slot, picked in frames.items():
+      kept &= times[slot][picked] <= boundaries[1]
   frames = {slot: picked[kept] for slot, picked in frames.items()}
 
   chunks: list[Chunk] = []
@@ -442,7 +539,7 @@ def main(args: Args) -> None:
       f"  {hand} ({slot}): {len(blobs)} images, {sum(map(len, blobs)) / 1e6:.1f} MB, "
       f"rows [{lo}, {hi}]"
     )
-  write_layer(out_path, session.session_id, account, chunks)
+  publish_state(out_path, session.session_id, account, chunks, args.overwrite)
   session.close()
   stage.cleanup()
   lap("layer written")

@@ -125,8 +125,16 @@ def state_ang_vel(hand: str) -> str:
 
 
 def state_opening(hand: str) -> str:
-  """The coupled finger joint angle, rad, in the left finger's sign."""
+  """Normalized opening: 0 at pad contact, 1 at the open limit.
+
+  State layers predating opening_rad store radians here.
+  """
   return f"{state_hand(hand)}/opening"
+
+
+def state_opening_rad(hand: str) -> str:
+  """The unclipped coupled joint angle in radians, in the left finger's sign."""
+  return f"{state_hand(hand)}/opening_rad"
 
 
 def state_finger(hand: str, joint: str) -> str:
